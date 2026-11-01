@@ -1,7 +1,7 @@
 # Zelda nativo no Mac — PT-BR
 
 Versão do [MacNativeGames](https://github.com/ly05010419/MacNativeGames) (de ly05010419, licença MIT) para jogar
-**Tears of the Kingdom** e **Breath of the Wild** em português, com duas correções de controle que valem para os dois
+**Tears of the Kingdom** e **Breath of the Wild** em português, com uma correção de controle que vale para os dois
 jogos.
 
 | Jogo | Versão | Português |
@@ -20,12 +20,10 @@ Este repositório **não contém nenhum arquivo do jogo, keys nem dos mods**. Vo
   (`games/totk/runtime/gamepad.m`). No macOS, o GameController não entrega o analógico esquerdo do Switch Pro Controller
   pelo Bluetooth (ele chega como D-pad). Com o pro-bridge rodando (servidor DSU em `127.0.0.1:26760`), os analógicos e o
   D-pad vêm dele. Sem o pro-bridge, nada muda.
-- **Desvio do giroscópio** (`games/totk/runtime/motion_fusion.c`). Alguns Pro Controllers têm calibração de fábrica
-  ruim (um deles lia 4, 8 e 1,5 graus/s parado), e a mira com movimento escorregava sozinha. Agora o desvio é medido
-  sempre que o controle fica parado por cerca de meio segundo e é descontado, como no SDL/Ryujinx.
-  `TOTK_GYRO_BIAS=0` desliga essa correção.
+A correção fica no runtime compartilhado (`games/totk/runtime`), que os dois apps usam.
 
-As correções ficam no runtime compartilhado (`games/totk/runtime`), que os dois apps usam.
+O desvio do giroscópio em Pro Controllers com calibração de fábrica ruim, que era corrigido aqui, agora é corrigido no
+projeto original (`games/totk/runtime/motion_fusion.c`, desde 2026-10-28); `TOTK_GYRO_BIAS=0` continua desligando.
 
 O português entra como **mod do jogador** (o projeto original já carrega mods de RomFS), sem mudar o build.
 
