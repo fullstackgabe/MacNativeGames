@@ -1912,6 +1912,17 @@ NVN(nvnCommandBufferSetCopyRowStride, void, NVNcommandBuffer *c, ptrdiff_t st) {
 /* Super Smash Bros. Ultimate sets the image stride (bytes between the layers or slices of a buffer <-> texture copy); 0 = tightly packed. */
 NVN(nvnCommandBufferSetCopyImageStride, void, NVNcommandBuffer *c, ptrdiff_t st) { if (st < 0) die("negative copy image stride %td", st); p_copy_stride *p = REC(c, OP_COPY_STRIDE, p_copy_stride); p->stride = st; p->image = 1; }
 NVN(nvnCommandBufferSetBlendColor, void, NVNcommandBuffer *c, const float *v) { memcpy(REC(c, OP_BLEND_COLOR, p_blend_color)->rgba, v, 16); }
+/* Super Smash Bros. Ultimate (Q61): the alpha test's reference value, recorded for the replay, which hands it with the
+   colour state's alpha function to the fragment shader's translation (Metal has no fixed-function alpha test). The first
+   distinct values are logged once. */
+NVN(nvnCommandBufferSetAlphaRef, void, NVNcommandBuffer *c, float r) {
+    REC(c, OP_ALPHA_REF, p_alpha_ref)->ref = r;
+    static float seen[8]; static int n; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&mu);
+    int known = 0; for (int i = 0; i < n; i++) if (seen[i] == r) known = 1;
+    if (!known && n < 8) { seen[n++] = r; LOG("[alpha-test] reference value %g (%d distinct so far)", (double)r, n); }
+    pthread_mutex_unlock(&mu);
+}
 
 // ---------- 状态对象：就地打包（nvn_obj.h） ----------
 // ---------- State objects: packed in place (nvn_obj.h) ----------
@@ -2150,8 +2161,28 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
     totk_tl(TL_SUB_OUT, 0, 0);
     free(heap);
 }
+/* Q89 (Smash, "FATAL 提交重入" on 25.10. after 33 s and on 28.10. after 124 min): Smash submits from two game threads (it
+   makes two NVN queues) and the replay has one open submission (nvn_mtl.m g_cb). The crash report of 28.10. 23:59 shows
+   thread 5 in mtl_sub_commit while thread 11 began the next submission in mtl_sub_begin. Submissions now run one at a
+   time: a thread that finds another one inside waits here (its virtual core is already given back, NVN_BLOCKING), and the
+   wait is counted, the first five and every 1,000th with both threads in the log, so a run shows the path that used to
+   end the game. */
+static pthread_mutex_t g_sub_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_sub_owner;           /* the thread inside, for the log */
+static _Atomic uint64_t g_sub_waits;
+static void submit_lock(void) {
+    uint64_t me = 0; pthread_threadid_np(NULL, &me);
+    if (pthread_mutex_trylock(&g_sub_mu)) {
+        uint64_t other = __atomic_load_n(&g_sub_owner, __ATOMIC_RELAXED), w = atomic_fetch_add(&g_sub_waits, 1) + 1;
+        if (other == me) die("a submission began inside a submission on the same thread %llu (the lock would wait forever)", (unsigned long long)me);
+        if (w <= 5 || w % 1000 == 0) LOG("[nvn] submission lock: thread %llu waited for thread %llu's submission to end (%llu waits so far)", (unsigned long long)me, (unsigned long long)other, (unsigned long long)w);
+        pthread_mutex_lock(&g_sub_mu);
+    }
+    __atomic_store_n(&g_sub_owner, me, __ATOMIC_RELAXED);
+}
 static void submit_exec(int n, const uint64_t *h, void *ucap) {
     gfx_enter();
+    submit_lock();
     totk_tl(TL_REP_BEGIN, 0, 0);
     pin_step(__atomic_load_n(&g_submits, __ATOMIC_RELAXED));   /* TOTK: free texture copies no recording refers to any more */
     if (cmdlog_env()) for (int i = 0; i < n; i++) {
@@ -2178,6 +2209,8 @@ static void submit_exec(int n, const uint64_t *h, void *ucap) {
     atomic_fetch_add(&g_sub_cpu_ns, dc); atomic_fetch_add(&g_cum_sub_cpu_ns, dc);
     atomic_fetch_add(&g_sub_instr, di); atomic_fetch_add(&g_cum_sub_instr, di);
     totk_tl(TL_REP_END, 0, 0);
+    __atomic_store_n(&g_sub_owner, 0, __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&g_sub_mu);
     gfx_leave();
 }
 
