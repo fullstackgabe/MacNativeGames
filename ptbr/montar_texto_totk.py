@@ -2,7 +2,7 @@
 """Monta o texto em português do Tears of the Kingdom 1.4.3 a partir da tradução Triforce Heroes (feita para a 1.2.1).
 
     python3.14 ptbr/montar_texto_totk.py --app "Tears of the Kingdom.app" \
-        --triforce "/caminho/Traducao + Dublagem -Triforce Heroes(Switch)/.../romfs" [--base USpt.Product.142.sarc.zs]
+        --triforce "/caminho/<pasta da tradução>/.../romfs" [--base USpt.Product.142.sarc.zs]
 
 O texto do jogo (Mals/USen.Product.<n>.sarc.zs) é um SARC de arquivos MSBT, um por conversa, e cada fala tem um rótulo.
 A tradução foi feita para a 1.2.1 (Product.121), e a 1.4.3 lê o Product.142, que tem algumas falas a mais. Aqui o

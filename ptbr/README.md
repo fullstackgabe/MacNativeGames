@@ -36,8 +36,9 @@ Você precisa do jogo base 1.0.0 (XCI ou NSP), do update **1.4.3** e do seu `pro
 python3.14 build_app.py ~/Games/totk.xci -k ~/keys/prod.keys --update ~/Games/totk-1.4.3.nsp
 ```
 
-Para o texto, você precisa da **Tradução + Dublagem Triforce Heroes 3.1** (Switch). Dela só se usa o texto,
-`romfs/Mals/USen.Product.121.sarc.zs`; a dublagem fica de fora e as vozes ficam as originais em inglês.
+Para o texto, você precisa da **Tradução Triforce Heroes 3.1** (Switch), no pacote completo ("Tradução + Dublagem") ou
+numa cópia só com as legendas (sem as pastas `romfs/Voice` e `romfs/Sound`). Dela só se usa o texto,
+`romfs/Mals/USen.Product.121.sarc.zs`; a dublagem nunca entra e as vozes ficam as originais em inglês.
 
 A tradução foi feita para a 1.2.1, e a 1.4.3 lê outro arquivo de texto (`Product.142`), com algumas falas a mais. Copiar
 o arquivo dela não serve. O `montar_texto_totk.py` refaz o texto da 1.4.3 fala por fala com as falas da tradução e
@@ -45,7 +46,7 @@ coloca o resultado na pasta de mods da 1.4.3:
 
 ```sh
 python3.14 ptbr/montar_texto_totk.py --app "/caminho/Tears of the Kingdom.app" \
-    --triforce "/caminho/Traducao + Dublagem -Triforce Heroes(Switch)/atmosphere/Contents/0100F2C0115B6000/romfs"
+    --triforce "/caminho/<pasta da tradução>/atmosphere/Contents/0100F2C0115B6000/romfs"
 python3.14 games/totk/scripts/make_mod_manifest.py \
     "$HOME/Library/Application Support/MacNativeGames/TOTK/mods/v143" --app "/caminho/Tears of the Kingdom.app"
 ```

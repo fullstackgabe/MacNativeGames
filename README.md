@@ -1,4 +1,4 @@
-> **Versão PT-BR:** Tears of the Kingdom (dublagem + legendas) e Breath of the Wild (legendas) em português (mods da comunidade), analógicos do Pro Controller via pro-bridge e correção do desvio do giroscópio. Veja [ptbr/README.md](ptbr/README.md). Projeto original: [ly05010419/MacNativeGames](https://github.com/ly05010419/MacNativeGames).
+> **Versão PT-BR:** Tears of the Kingdom e Breath of the Wild com legendas e textos em português e vozes originais em inglês (mods da comunidade), analógicos do Pro Controller via pro-bridge e correção do desvio do giroscópio. Veja [ptbr/README.md](ptbr/README.md). Projeto original: [ly05010419/MacNativeGames](https://github.com/ly05010419/MacNativeGames).
 
 # MacNativeGames
 
