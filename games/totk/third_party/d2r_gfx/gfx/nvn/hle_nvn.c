@@ -155,6 +155,7 @@ static uint64_t fence_now(int *token);
 static int fence_wait(uint64_t k, uint64_t timeout_ns);
 static int fence_wait_to(uint64_t k, uint64_t kg, uint64_t timeout_ns);
 static void x_drain(void);
+static void replay_enter(void), replay_leave(void);   // the replay section (below)
 static int async_replay(void);
 static int call_stats_on(void);
 static void call_stats_end(const void *cb, const uint8_t *copy);
@@ -230,17 +231,16 @@ NVN(nvnDeviceInstallDebugCallback, void, NVNdevice *d, const PFNNVNDEBUGCALLBACK
     dev_t_ *o = (dev_t_ *)d; o->dbg_cb = B(enable) ? (void *)cb : NULL; o->dbg_data = data;
 }
 NVN(nvnDeviceSetWindowOriginMode, void, NVNdevice *d, NVNwindowOriginMode m) { ((dev_t_ *)d)->origin = m; LOG("[nvn] 窗口原点 %s", m ? "左上（同 D3D / Metal）" : "左下（GL）"); }
-#ifdef GAME_BOTW
 /* NVN's default depth mode is NEAR_IS_MINUS_W (enum value 0, the OpenGL convention): a device the game never calls
    nvnDeviceSetDepthMode on keeps it. TOTK sets it explicitly; Breath of the Wild never does, and its full-screen copy
    to the swapchain has clip z = -1 (the near plane), which the 0..w convention clipped away: the window stayed magenta
    (botw.md). */
 static _Atomic int g_depth_near_minus_w = 1;
-#else
-static _Atomic int g_depth_near_minus_w;
-#endif
+/* Also the offline seed's initial state: seed-shaders never boots the game or calls SetDepthMode. Giving it a different
+   default compiled Bananza's fullscreen vertices without clip-z conversion; Metal clipped every fragment away. */
 int totk_depth_near_minus_w(void) { return atomic_load(&g_depth_near_minus_w); }
-NVN(nvnDeviceSetDepthMode, void, NVNdevice *d, NVNdepthMode m) { ((dev_t_ *)d)->depth_mode = m; atomic_store(&g_depth_near_minus_w, m == NVN_DEPTH_MODE_NEAR_IS_MINUS_W); LOG("[nvn] 深度模式 %s", m ? "近=0（同 D3D / Metal）" : "近=-w（GL）：顶点着色器翻译时做 z=(z+w)/2 转换"); }
+void totk_depth_set_near_minus_w(int value) { atomic_store(&g_depth_near_minus_w, value != 0); }
+NVN(nvnDeviceSetDepthMode, void, NVNdevice *d, NVNdepthMode m) { ((dev_t_ *)d)->depth_mode = m; totk_depth_set_near_minus_w(m == NVN_DEPTH_MODE_NEAR_IS_MINUS_W); LOG("[nvn] 深度模式 %s", m ? "近=0（同 D3D / Metal）" : "近=-w（GL）：顶点着色器翻译时做 z=(z+w)/2 转换"); }
 NVN(nvnDeviceFinalizeCommandHandle, void, NVNdevice *d, NVNcommandHandle h) { (void)d; (void)h; }
 
 // ---------- 内存池 ----------
@@ -284,7 +284,7 @@ NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) {
     /* The same condition nvnMemoryPoolInitialize registered the pool under: an empty pool (size 0) was given no
        buffer and no dirty range, so its teardown is a no-op — a removal by address could otherwise hit a live
        neighbour's range when the game's allocator handed the empty pool an address next to one (#1367). */
-    if (o->mem && o->size && !(o->flags & NVN_MEMORY_POOL_FLAGS_GPU_NO_ACCESS)) { x_drain(); nvn_dirty_remove_range(o->mem); mtl_pool_del(o->mem); }
+    if (o->mem && o->size && !(o->flags & NVN_MEMORY_POOL_FLAGS_GPU_NO_ACCESS)) { replay_enter(); nvn_dirty_remove_range(o->mem); mtl_pool_del(o->mem); replay_leave(); }
     totk_vpool_fini(o); o->magic = 0;
 }
 /* A mirrored render target has private Metal storage. Reconcile GPU writes at mapped-range cache maintenance too:
@@ -336,32 +336,86 @@ NVN(nvnBufferFlushMappedRange, void, const NVNbuffer *b,ptrdiff_t off,size_t siz
 
 // ---------- 描述符池 ----------
 // ---------- Descriptor pools ----------
+/* One ID space per descriptor pool. In NVN a texture, image or sampler ID indexes the pool the command buffer has bound
+   (SetTexturePool / SetSamplerPool), and two pools may use the same IDs. The host keeps one table of each kind, so each
+   pool gets a base in it, in the order pools are first initialised: registrations go to base + ID, and the handles a
+   command buffer binds get the base of the pool it last bound (bind_handles_rec); the replay's bound check takes the
+   bound pool's base + size (nvn_mtl.m OP_SET_TEX_POOL). A game with one pool of each kind keeps base 0. Design of
+   seedds/nxnative (hle_nvn.c dpool_add / bind_handles, MIT; Fire Emblem: Three Houses), as in kirakira-dev/ouncenative.
+   Pokemon Pokopia makes three texture pools (33,024 / 16,640 / 4,352) and three sampler pools; its second texture pool
+   registers textures in some scenes, which overwrote the first one's IDs in one table (2026-11-04). */
+enum { NDPOOL = 16 };
+static struct dpool_base { const void *pool; int base; } g_tpb[NDPOOL], g_spb[NDPOOL];
+static int g_ntpb, g_nspb, g_tnext, g_snext;
+static pthread_mutex_t g_dpool_mu = PTHREAD_MUTEX_INITIALIZER;
+static int dpool_add(struct dpool_base *t, int *nt, int *next, const void *pool, int n, const char *kind) {   // -> the pool's base
+    pthread_mutex_lock(&g_dpool_mu);
+    int i = 0; while (i < *nt && t[i].pool != pool) i++;
+    if (i == *nt) {
+        if (*nt == NDPOOL) { pthread_mutex_unlock(&g_dpool_mu); LOG("【红】%s 描述符池超过 %d 个：后面的和第一个池共用编号", kind, NDPOOL); return 0; }
+        t[i] = (struct dpool_base){pool, *next}; (*nt)++; *next += (n + 255) & ~255;
+        if (i) LOG("[nvn] %s pool #%d (%d entries): numbered from %d in the host table, apart from the earlier pools", kind, i + 1, n, t[i].base);
+    }
+    int b = t[i].base; pthread_mutex_unlock(&g_dpool_mu); return b;
+}
+static int dpool_base(const struct dpool_base *t, int nt, const void *pool) { for (int i = 0; i < nt; i++) if (t[i].pool == pool) return t[i].base; return 0; }
+int nvn_tex_pool_base(const void *pool) { return dpool_base(g_tpb, g_ntpb, pool); }   // nvn_mtl.m: the bound pool's part of the table
+/* The pools each command buffer last bound, as bases (only command buffers that bound a pool other than the first). */
+static struct { const void *cmd; int tb, sb; } g_cbpool[64]; static _Atomic int g_ncbpool;
+static void cb_pool_set(const void *c, int tex, int base) {
+    pthread_mutex_lock(&g_dpool_mu);
+    int i = 0, n = atomic_load(&g_ncbpool); while (i < n && g_cbpool[i].cmd != c) i++;
+    if (i == n && base && n < 64) { g_cbpool[n] = (typeof(g_cbpool[0])){c, 0, 0}; atomic_store(&g_ncbpool, n + 1); }
+    if (i < atomic_load(&g_ncbpool)) { if (tex) g_cbpool[i].tb = base; else g_cbpool[i].sb = base; }
+    else if (base) LOG("【红】超过 64 个命令缓冲绑定了非首个描述符池：多出的按第一个池算");
+    pthread_mutex_unlock(&g_dpool_mu);
+}
 NVN(nvnTexturePoolInitialize, NVNboolean, NVNtexturePool *tp, const NVNmemoryPool *p, ptrdiff_t off, int n) {
-    *(dpool_t *)tp = (dpool_t){(const pool_t *)p, off, n}; OLOG("TexturePool n=%d", n); mtl_set_tex_pool_n(n); return 1;
+    *(dpool_t *)tp = (dpool_t){(const pool_t *)p, off, n}; OLOG("TexturePool n=%d", n);
+    dpool_add(g_tpb, &g_ntpb, &g_tnext, tp, n, "texture");
+    if (getenv("TOTK_BIND_TRACE")) LOG("[pool] TexturePoolInitialize %p memory pool %p +%#llx descriptors %d", (void *)tp, (void *)p, (unsigned long long)off, n);   // diagnostic
+    return 1;
+}
+/* TOTK_BIND_TRACE (diagnostic): per texture pool, registrations and the highest id, every 2,000 registrations. */
+static void pool_reg_note(const void *tp, int id, int image) {
+    static int on = -1; if (on < 0) on = getenv("TOTK_BIND_TRACE") != NULL;
+    if (!on) return;
+    static const void *pools[8]; static long cnt[8]; static int maxid[8], np;
+    int k = 0; while (k < np && pools[k] != tp) k++;
+    if (k == np) { if (np == 8) return; pools[np++] = tp; }
+    cnt[k]++; if (id > maxid[k]) maxid[k] = id;
+    if (cnt[k] % 2000 == 1) LOG("[pool] texture pool %p: %ld registrations (%s id %d), highest id %d", tp, cnt[k], image ? "image" : "texture", id, maxid[k]);
 }
 NVN(nvnTexturePoolFinalize, void, NVNtexturePool *tp) { (void)tp; }
 extern uint64_t g_frame_pub;
-NVN(nvnTexturePoolRegisterTexture, void, const NVNtexturePool *tp, int id, const NVNtexture *t, const NVNtextureView *v) { (void)tp;
+NVN(nvnTexturePoolRegisterTexture, void, const NVNtexturePool *tp, int id, const NVNtexture *t, const NVNtextureView *v) { pool_reg_note(tp, id, 0);
     { static long want = -2; if (want == -2) { const char *e = getenv("DM_NVN_REGLOG"); want = e ? atol(e) : -1; }   // TOTK diagnostic: DM_NVN_REGLOG=<id> logs every registration of that texture id
         static long rf0 = -2, rf1; if (rf0 == -2) { const char *e = getenv("DM_NVN_REGLOG_FRAMES"); rf0 = e ? atol(e) : -1; rf1 = e && strchr(e, '-') ? atol(strchr(e, '-') + 1) : rf0; }   // DM_NVN_REGLOG_FRAMES=a-b: log every registration in those frames
         if ((want >= 0 && id == want) || (rf0 >= 0 && (long)g_frame_pub >= rf0 && (long)g_frame_pub <= rf1)) { const tex_t *x = (const tex_t *)t; const view_t *vv = (const view_t *)v;
             LOG("[reglog] F%llu id=%d ser=%llu fmt=%#x %ux%u lv%u flags=%#x mem=%p pool=%p off=%lld view=%s vfmt=%#x vlv=%d+%d", (unsigned long long)g_frame_pub, id, (unsigned long long)x->serial, x->d.format, x->d.width, x->d.height, x->d.levels, x->d.flags, (void *)x->mem, (void *)x->pool, (long long)x->off,
                 vv ? "yes" : "no", vv && vv->set_format ? vv->format : 0, vv && vv->set_levels ? vv->base_level : -1, vv && vv->set_levels ? vv->nlevels : 0); } }
+    id += dpool_base(g_tpb, g_ntpb, tp);   // this pool's part of the host table
     totk_life_reg(id, (const tex_t *)t);
     mtl_reg_tex(id, (const tex_t *)t, (const view_t *)v); }
 /* An image descriptor: NVN keeps texture and image descriptors in one texture pool under one id space (nvnDeviceGetImageHandle
    is the id here), so the image is registered in the same table a texture is, and BindImage(s) finds it by that id.
    Unimplemented until Pokemon Pokopia registered its compute shaders' images with it: their handles named nothing and the
    GPU faulted on an address (kIOGPUCommandBufferCallbackErrorPageFault), then hung. */
-NVN(nvnTexturePoolRegisterImage, void, const NVNtexturePool *tp, int id, const NVNtexture *t, const NVNtextureView *v) { (void)tp;
+NVN(nvnTexturePoolRegisterImage, void, const NVNtexturePool *tp, int id, const NVNtexture *t, const NVNtextureView *v) { pool_reg_note(tp, id, 1);
+    { static int on = -1, left = 40; if (on < 0) on = getenv("TOTK_BIND_TRACE") != NULL;   // with the bind trace: each image registration (id -> serial)
+      if (on && left > 0) { left--; LOG("[bind] RegisterImage id %d ser %llu %ux%u fmt %#x mem %p", id, (unsigned long long)((const tex_t *)t)->serial, ((const tex_t *)t)->d.width, ((const tex_t *)t)->d.height, ((const tex_t *)t)->d.format, (void *)((const tex_t *)t)->mem); } }
+    id += dpool_base(g_tpb, g_ntpb, tp);   // this pool's part of the host table
     totk_life_reg(id, (const tex_t *)t);
     mtl_reg_tex(id, (const tex_t *)t, (const view_t *)v); }
 
 NVN(nvnSamplerPoolInitialize, NVNboolean, NVNsamplerPool *sp, const NVNmemoryPool *p, ptrdiff_t off, int n) {
-    *(dpool_t *)sp = (dpool_t){(const pool_t *)p, off, n}; OLOG("SamplerPool n=%d", n); return 1;
+    *(dpool_t *)sp = (dpool_t){(const pool_t *)p, off, n}; OLOG("SamplerPool n=%d", n);
+    dpool_add(g_spb, &g_nspb, &g_snext, sp, n, "sampler");
+    if (getenv("TOTK_BIND_TRACE")) LOG("[pool] SamplerPoolInitialize %p memory pool %p +%#llx descriptors %d", (void *)sp, (void *)p, (unsigned long long)off, n);   // diagnostic
+    return 1;
 }
 NVN(nvnSamplerPoolFinalize, void, NVNsamplerPool *sp) { (void)sp; }
-NVN(nvnSamplerPoolRegisterSampler, void, const NVNsamplerPool *sp, int id, const NVNsampler *s) { (void)sp; mtl_reg_samp(id, &((const samp_t *)s)->p); }
+NVN(nvnSamplerPoolRegisterSampler, void, const NVNsamplerPool *sp, int id, const NVNsampler *s) { mtl_reg_samp(dpool_base(g_spb, g_nspb, sp) + id, &((const samp_t *)s)->p); }
 
 // ---------- 贴图 ----------
 // ---------- Textures ----------
@@ -524,7 +578,7 @@ static void read_texels(const tex_t *o, const view_t *v, const NVNcopyRegion *r,
     if (!row) row = wb;
     if (!img) img = row * hb;
     unsigned level = v && v->set_levels ? (unsigned)v->base_level : 0, layer0 = v && v->set_layers ? (unsigned)v->min_layer : 0;
-    x_drain(); mtl_read_texels(o, level, layer0, r, dst, (size_t)row, (size_t)img);
+    replay_enter(); mtl_read_texels(o, level, layer0, r, dst, (size_t)row, (size_t)img); replay_leave();
 }
 NVN(nvnTextureReadTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, void *dst) {
     read_texels(CTX(t), (const view_t *)v, r, dst, 0, 0);
@@ -540,7 +594,7 @@ static void write_texels(const tex_t *o, const view_t *v, const NVNcopyRegion *r
     if (row < (ptrdiff_t)wb || img < row * (ptrdiff_t)hb) die("WriteTexels: stride smaller than region");
     unsigned level = v && v->set_levels ? (unsigned)v->base_level : 0, layer0 = v && v->set_layers ? (unsigned)v->min_layer : 0;
     if (v && v->set_format && v->format != o->d.format) die("WriteTexels: format-reinterpreting view not supported");
-    x_drain(); mtl_write_texels(o, level, layer0, r, src, (size_t)row, (size_t)img);
+    replay_enter(); mtl_write_texels(o, level, layer0, r, src, (size_t)row, (size_t)img); replay_leave();
 }
 NVN(nvnTextureWriteTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, const void *src) {
     write_texels(CTX(t), (const view_t *)v, r, src, 0, 0);
@@ -595,7 +649,7 @@ NVN(nvnSamplerFinalize, void, NVNsampler *s) { ((samp_t *)s)->magic = 0; }
 NVN(nvnProgramInitialize, NVNboolean, NVNprogram *p, NVNdevice *d) {
     (void)d; memset(p, 0, sizeof(prog_t)); ((prog_t *)p)->magic = MAGIC('P', 'R', 'O', 'G'); return 1;
 }
-NVN(nvnProgramFinalize, void, NVNprogram *p) { x_drain(); mtl_prog_release((prog_t *)p); ((prog_t *)p)->magic = 0; }
+NVN(nvnProgramFinalize, void, NVNprogram *p) { replay_enter(); mtl_prog_release((prog_t *)p); replay_leave(); ((prog_t *)p)->magic = 0; }
 NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData *sd) {
     NVN_BLOCKING();
     prog_t *o = (prog_t *)p;
@@ -672,6 +726,13 @@ NVN(nvnSyncFinalize, void, NVNsync *s) { ((sync_t *)s)->magic = 0; }
    to find the game code that makes frame N+1 wait for frame N on the GPU (see the 2026-10-15 timeline). */
 static void guest_chain(const char *what);
 static uint64_t g_frame;   // tentative; defined with the frame bookkeeping below
+/* TOTK_QUEUE_TRACE=<first frame>:<frames> (diagnostic): each queue submit, fence, wait, window acquire and present of those
+   frames, in call order with its queue, to see how a game orders work across its queues (Pokemon Pokopia, 2026-11-03) */
+static void qtrace(const char *what, const void *q, long a, long b) {
+    static long f0 = -1, nf; if (f0 < 0) { const char *e = getenv("TOTK_QUEUE_TRACE"); f0 = e ? atol(e) : 0; nf = e && strchr(e, ':') ? atol(strchr(e, ':') + 1) : (e ? 3 : 0); }
+    if (!nf || (long)g_frame < f0 || (long)g_frame >= f0 + nf) return;
+    LOG("[qtrace] F%llu %s q=%p %ld %ld", (unsigned long long)g_frame, what, q, a, b);
+}
 static uint64_t g_game_sys;
 extern _Atomic int runtime_survey_pending;
 extern void runtime_survey_tick(uint64_t frame);
@@ -708,7 +769,7 @@ static int sync_chain_left(int k) {
     if (lim == -2) { const char *e = getenv("TOTK_SYNC_CHAIN"); lim = e ? atoi(e) : 0; from = e && strchr(e, ':') ? strtoull(strchr(e, ':') + 1, NULL, 10) : 0; }
     return lim > 0 && g_frame >= from && atomic_fetch_add(&used[k], 1) < lim;
 }
-NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) { (void)q; (void)c; (void)f; int tok; uint64_t v = fence_now(&tok); ((sync_t *)s)->fenced = tok ? 5 : 1; ((sync_t *)s)->fence = v;
+NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) { qtrace("fence", q, (long)(uintptr_t)s, 0); (void)c; (void)f; int tok; uint64_t v = fence_now(&tok); ((sync_t *)s)->fenced = tok ? 5 : 1; ((sync_t *)s)->fence = v;
     if (sync_chain_left(0)) { char w[96]; snprintf(w, sizeof w, "FenceSync sync=%p fence=%llu cond=%d flags=%d", (void *)s, (unsigned long long)v, (int)c, f); guest_chain(w); } }
 // 没围栏过的同步对象按真机行为等到超时；已围栏的只在 GPU 真正完成到该栅栏值后放行
 // A sync object that was never fenced waits until timeout, as on a real device; a fenced one is released only after the GPU has actually completed up to that fence value
@@ -804,7 +865,7 @@ NVN(nvnQueueGetError, NVNqueueGetErrorResult, NVNqueue *q, NVNqueueErrorInfo *in
     (void)q; if (info) memset(info, 0, sizeof *info); return NVN_QUEUE_GET_ERROR_RESULT_GPU_NO_ERROR;
 }
 NVN(nvnQueueFlush, void, NVNqueue *q) { (void)q; }
-NVN(nvnQueueFinish, void, NVNqueue *q) { NVN_BLOCKING(); (void)q; totk_tl(TL_FINISH_IN, 0, 0); x_drain(); mtl_finish(); mtl_wb_fence_done(); totk_tl(TL_FINISH_OUT, 0, 0); }
+NVN(nvnQueueFinish, void, NVNqueue *q) { NVN_BLOCKING(); (void)q; totk_tl(TL_FINISH_IN, 0, 0); replay_enter(); mtl_finish(); mtl_wb_fence_done(); replay_leave(); totk_tl(TL_FINISH_OUT, 0, 0); }
 
 // ---------- 命令缓冲：录进游戏的命令内存，提交时执行 CPU 可见副作用 ----------
 // ---------- Command buffer: record into the game's command memory, perform CPU-visible side effects at submit ----------
@@ -852,7 +913,12 @@ NVN(nvnCommandBufferInitialize, NVNboolean, NVNcommandBuffer *c, NVNdevice *d) {
     memset(c, 0, sizeof(cmd_t)); CB(c)->magic = MAGIC('C', 'M', 'D', 'B'); CB(c)->dev = d; CB(c)->inline_cur = ~0ull; CB(c)->inline_end = 0; return 1;
 }
 NVN(nvnCommandBufferFinalize, void, NVNcommandBuffer *c) { free(CB(c)->seg); CB(c)->seg = CB(c)->cur = CB(c)->end = NULL; CB(c)->magic = 0; }
-NVN(nvnCommandBufferSetMemoryCallback, void, NVNcommandBuffer *c, PFNNVNCOMMANDBUFFERMEMORYCALLBACKPROC cb) { CB(c)->cb = cb; }
+/* TOTK_CTL_LOG (diagnostic): memory callbacks, control memory additions, and the first recording of each command buffer
+   past the control memory it was given (how a game sizes and refills its control memory; Pokemon Pokopia, 2026-11-03) */
+static int ctl_log_left(void) { static int on = -1; static _Atomic int left = 200; if (on < 0) on = getenv("TOTK_CTL_LOG") != NULL; return on && atomic_fetch_sub(&left, 1) > 0; }
+void runtime_describe_address(uint64_t a, char *out, size_t n);
+NVN(nvnCommandBufferSetMemoryCallback, void, NVNcommandBuffer *c, PFNNVNCOMMANDBUFFERMEMORYCALLBACKPROC cb) { CB(c)->cb = cb;
+    if (ctl_log_left()) { char w[96] = ""; runtime_describe_address((uint64_t)(uintptr_t)cb, w, sizeof w); LOG("[ctl] SetMemoryCallback cb=%p fn=%s", (void *)c, w); } }
 NVN(nvnCommandBufferSetMemoryCallbackData, void, NVNcommandBuffer *c, void *d) { CB(c)->cb_data = d; }
 static uint8_t *align8(uint8_t *p) { return (uint8_t *)(((uintptr_t)p + 7) & ~(uintptr_t)7); }
 // 诊断 DM_NVN_CMDSTAT=1：每 300 帧记一行命令录制的用量——每帧录了多少字节 / 多少条、游戏每次给多大一段命令内存、每帧补内存回调几次、宿主补段几次、
@@ -916,6 +982,7 @@ NVN(nvnCommandBufferAddCommandMemory, void, NVNcommandBuffer *c, const NVNmemory
 // The SDK encodes handles in control memory (sdk+0x444530). Reusing that storage retires its copies.
 NVN(nvnCommandBufferAddControlMemory, void, NVNcommandBuffer *c, void *m, size_t n) {
     if (cmdlog_env()) LOG("[cmd] AddControlMemory cb=%p mem=%p size=%#zx", (void *)c, m, n);
+    if (ctl_log_left()) LOG("[ctl] F%llu AddControlMemory cb=%p mem=%p size=%#zx (was %p used %#zx of %#zx)", (unsigned long long)g_frame_pub, (void *)c, m, n, CB(c)->ctl, CB(c)->ctl_used, CB(c)->ctl_size);
 #ifndef GAME_BOTW   /* NVN 53 handles do not live in control memory: Breath of the Wild re-adds a command buffer's control memory and keeps calling handles recorded before (botw.md) */
     release_copies((uintptr_t)m, (uintptr_t)m + n);
 #endif
@@ -1198,11 +1265,14 @@ static void release_copies(uintptr_t lo, uintptr_t hi) {
 #define COPY_TOKEN_MAGIC 0x4e454b4f54594d43ull
 extern __thread sigjmp_buf *runtime_fault_guard;   // runtime/loader.c: a guarded read of guest memory survives a fault
 static int async_replay(void);   /* below: TOTK_ASYNC_REPLAY */
-/* With the translation thread (TOTK_ASYNC_REPLAY=1, iPhone default) the game may reuse a submitted command buffer's control
-   memory as soon as the submit call returns, before the queued replay used the copy: marks are not used there yet (a copy
-   last submitted at or after the submission being replayed would have to be kept). */
-static int copy_token_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_COPY_TOKEN"); v = !(e && !strcmp(e, "0")) && !async_replay();
-    if (!v) LOG("[cmd] 录制副本记号：关（%s）：副本只在控制内存被重新加入时释放", e && !strcmp(e, "0") ? "TOTK_COPY_TOKEN=0" : "翻译线程模式还不支持"); } return v; }
+/* With the translation thread (TOTK_ASYNC_REPLAY=1) the game may reuse a submitted command buffer's control memory as soon
+   as the submit call returns, before the queued replay used the copy. Marks are used there too: a copy whose mark is gone
+   is released through copy_free, which keeps its memory until every submission pushed before the release has been
+   replayed (g_retired). They were off in that mode until 2026-11-03, from before copy_free waited for the replay: Pokemon
+   Pokopia (translation thread on, control memory never added again) kept every recording, 100,000 live copies (2 GiB) in
+   four minutes, and the sweep's walk over them (pin_scan) stopped the replay for 0.4-0.6 s every 1.5 s. */
+static int copy_token_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_COPY_TOKEN"); v = !(e && !strcmp(e, "0"));
+    if (!v) LOG("[cmd] 录制副本记号：关（TOTK_COPY_TOKEN=0）：副本只在控制内存被重新加入时释放"); } return v; }
 static void copy_token_write(uintptr_t at, const uint8_t *copy) { uint64_t v[2] = {COPY_TOKEN_MAGIC, (uint64_t)(uintptr_t)copy}; memcpy((void *)at, v, sizeof v); }
 static int copy_token_negative(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_PROBE_NEGATIVE"); v = e && atoi(e) == 22; } return v; }   /* probe negative 22: marks never checked */
 /* Reading a mark (pin_scan): the fault guard is armed only around the 16-byte read; the jump buffer is set once per walked
@@ -1230,6 +1300,25 @@ static void cbk_compact(void) {
     }
     free(ob); g_cbk_used = live; g_cbk_empty = 0; g_cbk_compactions++;
 }
+#ifndef GAME_BOTW
+/* A recording takes 64 bytes of its command buffer's control memory (the handle's descriptor and its mark). When they are
+   not left, NVN's driver calls the command buffer's memory callback (NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_CONTROL_MEMORY)
+   and the game adds control memory there, often the same memory again (a ring): re-adding it releases the copies recorded
+   in it (release_copies), as the handles there are gone on hardware too. The callback was never called before 2026-11-03:
+   Pokemon Pokopia gives each command buffer its control memory once and refills it only from its callback (main+0x1144990),
+   so its recordings went past the memory after about 1,900 frames, carried no mark, and none was ever released: 100,000
+   live copies (2 GiB) in four minutes and a sweep over them that stopped the replay for half a second every 1.5 s. */
+static uint64_t g_ctl_refills, g_ctl_refill_short;
+static void ctl_ensure(NVNcommandBuffer *c, cmd_t *o) {
+    if (!o->ctl || o->ctl_used + 64 <= o->ctl_size || !o->cb) return;
+    o->cb(c, NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_CONTROL_MEMORY, 64, o->cb_data);   /* game code: it adds control memory (nvnCommandBufferAddControlMemory) */
+    g_ctl_refills++;
+    if (o->ctl_used + 64 > o->ctl_size && !g_ctl_refill_short++)
+        LOG("【红】控制内存回调之后仍然不够（cb=%p，%#zx 已用 / %#zx）：这次录制不写记号，副本只能等控制内存被重新加入时释放", (void *)c, o->ctl_used, o->ctl_size);
+    if (ctl_log_left()) LOG("[ctl] F%llu cb=%p out of control memory: memory callback called (%llu so far), now %p %#zx used of %#zx", (unsigned long long)g_frame_pub, (void *)c,
+                            (unsigned long long)g_ctl_refills, o->ctl, o->ctl_used, o->ctl_size);
+}
+#endif
 NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
     if (runtime_frametrace_event) runtime_frametrace_event(11);
     cmd_t *o = CB(c);
@@ -1262,10 +1351,13 @@ NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
        finalised textures kept for them after 44 minutes). */
     int token = lo && copy_token_on();
 #else
+    ctl_ensure(c, o);
     uintptr_t lo = (uintptr_t)o->ctl + (o->ctl_used < o->ctl_size ? o->ctl_used : 0);
     uintptr_t hi = o->ctl ? lo + 1 : 0;
     int token = o->ctl && o->ctl_used + 64 <= o->ctl_size && copy_token_on();   /* only inside the control memory the game gave */
 #endif
+    if (o->ctl && o->ctl_used + 64 > o->ctl_size && o->ctl_used <= o->ctl_size && ctl_log_left())
+        LOG("[ctl] F%llu cb=%p recording past its control memory %p (%#zx used of %#zx), memory callback %s", (unsigned long long)g_frame_pub, (void *)o, o->ctl, o->ctl_used, o->ctl_size, o->cb ? "set" : "none");
     o->ctl_used += 64;
     if (token) copy_token_write(lo, copy);
     pthread_mutex_lock(&g_copy_mu);
@@ -1711,6 +1803,7 @@ static void pin_step(uint64_t now) {
     if (!pin_sweep_on()) return;
     uint64_t t0 = now_ns();
     pthread_mutex_lock(&g_copy_mu); pthread_mutex_lock(&g_pin_mu);
+    retired_sweep();   /* copies released by their marks wait here for the replay (copy_free), not only those of a re-added control memory */
     if (!g_pin_win_end) pin_window_start(now);
     pin_scan((g_pin_scan_cap + PIN_SCAN_SLICES - 1) / PIN_SCAN_SLICES);
     size_t freed = 0, recent = 0; int decided = 0;
@@ -2095,6 +2188,16 @@ static void bind_handles_rec(NVNcommandBuffer *c, int op, int st, int first, int
     if (n < 0 || n > 32) { LOG("【红】绑定句柄数 %d", n); return; }
     p_bind_handles *r = RECN(c, op, p_bind_handles, h, n); r->stage = st; r->first = first; r->n = n; r->pad_ = 0;
     r->src = deferred ? (uint64_t)(uintptr_t)h : 0; memcpy(r->h, h, 8 * n);
+    if (atomic_load(&g_ncbpool)) {   // a command buffer that bound a pool other than the first: its IDs into that pool's part of the table (texture ID bits 0-19, sampler ID from bit 20)
+        int tb = 0, sb = 0, nc = atomic_load(&g_ncbpool);
+        for (int i = 0; i < nc; i++) if (g_cbpool[i].cmd == (const void *)c) { tb = g_cbpool[i].tb; sb = g_cbpool[i].sb; break; }
+        if ((tb || sb) && deferred) { static _Atomic int said; if (!atomic_exchange(&said, 1)) LOG("【红】延迟绑定的句柄在提交时才读：非首个描述符池的编号偏移还没加到它们上"); }
+        for (int i = 0; i < n && (tb || sb) && !deferred; i++) {
+            uint64_t v = r->h[i], tid = v & 0xfffff, sid = v >> 20;
+            if (op == OP_BIND_SAMP) { if (sid) r->h[i] = (sid + (uint64_t)sb) << 20; }
+            else { if (tid) tid += (uint64_t)tb; if (sid && op == OP_BIND_TEX) sid += (uint64_t)sb; r->h[i] = tid | sid << 20; }
+        }
+    }
     if (totk_life_on() && (op == OP_BIND_TEX || op == OP_BIND_IMG)) for (int k = 0; k < n; k++) life_bind(c, op, st, first + k, h + k, deferred);
     hw_fix(CB(c), 16 + 4 * (size_t)n);   /* macro 7 + method 0x1a2c + CB_POS and one 32-bit handle word per binding (64-bit handles: callers override with 16 + 8n) */
 }
@@ -2219,6 +2322,12 @@ NVN(nvnCommandBufferDrawElementsBaseVertex, void, NVNcommandBuffer *c, NVNdrawPr
 /* Indirect: the 20-byte record at ind is NVN's DrawElementsIndirectData {count, instances, first index, base vertex, base
    instance}, Metal's MTLDrawIndexedPrimitivesIndirectArguments; the GPU reads it when the draw runs, so a record an earlier
    pass wrote this frame is seen (Donkey Kong Bananza's terrain: seedds/nxnative's game note). nvn_mtl.m draw_inner. */
+/* The non-indexed form: the 16-byte record at ind is NVN's DrawArraysIndirectData {count, instances, first vertex, base
+   instance}, Metal's MTLDrawPrimitivesIndirectArguments (nvn_mtl.m draw_inner). Pokemon Pokopia calls it; seedds/nxnative
+   records it the same way (MIT). */
+NVN(nvnCommandBufferDrawArraysIndirect, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNbufferAddress ind) {
+    *REC(c, OP_DRAW, p_draw) = (p_draw){pr, 0, 0, 0, 1, 0, ind}; hw_fix(CB(c), 40);
+}
 NVN(nvnCommandBufferDrawElementsIndirect, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, NVNbufferAddress ib, NVNbufferAddress ind) {
     *REC(c, OP_DRAW_IDX, p_draw_idx) = (p_draw_idx){pr, it, 0, 0, 0, 1, ib, ind}; hw_fix(CB(c), 48);
 }
@@ -2244,8 +2353,11 @@ NVN(nvnCommandBufferDispatchCompute, void, NVNcommandBuffer *c, int x, int y, in
     *REC(c, OP_DISPATCH, p_dispatch) = (p_dispatch){x, y, z, (uint64_t)__builtin_return_address(0)};
 }
 NVN(nvnCommandBufferBarrier, void, NVNcommandBuffer *c, int bits) { *(int32_t *)rec(c, OP_BARRIER, 8) = bits; }
-NVN(nvnCommandBufferSetTexturePool, void, NVNcommandBuffer *c, const NVNtexturePool *p) { REC(c, OP_SET_TEX_POOL, p_set_pool)->pool = (const dpool_t *)p; }
-NVN(nvnCommandBufferSetSamplerPool, void, NVNcommandBuffer *c, const NVNsamplerPool *p) { REC(c, OP_SET_SAMP_POOL, p_set_pool)->pool = (const dpool_t *)p; }
+NVN(nvnCommandBufferSetTexturePool, void, NVNcommandBuffer *c, const NVNtexturePool *p) {
+    { static int on = -1, left = 20; static const void *last; if (on < 0) on = getenv("TOTK_BIND_TRACE") != NULL;   // diagnostic: changes of the bound texture pool
+      if (on && p != last && left > 0) { left--; last = p; LOG("[pool] F%llu SetTexturePool %p (%d descriptors)", (unsigned long long)g_frame, (const void *)p, p ? ((const dpool_t *)p)->n : 0); } }
+    REC(c, OP_SET_TEX_POOL, p_set_pool)->pool = (const dpool_t *)p; cb_pool_set(c, 1, dpool_base(g_tpb, g_ntpb, p)); }
+NVN(nvnCommandBufferSetSamplerPool, void, NVNcommandBuffer *c, const NVNsamplerPool *p) { REC(c, OP_SET_SAMP_POOL, p_set_pool)->pool = (const dpool_t *)p; cb_pool_set(c, 0, dpool_base(g_spb, g_nspb, p)); }
 
 NVN(nvnCommandBufferCopyBufferToTexture, void, NVNcommandBuffer *c, NVNbufferAddress src, const NVNtexture *t, const NVNtextureView *v,
     const NVNcopyRegion *r, int flags) {
@@ -2268,7 +2380,10 @@ NVN(nvnCommandBufferCopyTextureToTexture, void, NVNcommandBuffer *c, const NVNte
     p_copy_t2t *o = REC(c, OP_COPY_T2T, p_copy_t2t); o->src = tex_pin(s); o->dst = tex_pin(d);
     copy_view(&o->sv, &o->has_sv, sv); copy_view(&o->dv, &o->has_dv, dv); o->sr = *sr; o->dr = *dr; o->flags = flags;
 }
-NVN(nvnCommandBufferSetCopyRowStride, void, NVNcommandBuffer *c, ptrdiff_t st) { REC(c, OP_COPY_STRIDE, p_copy_stride)->stride = st; }
+NVN(nvnCommandBufferSetCopyRowStride, void, NVNcommandBuffer *c, ptrdiff_t st) { *REC(c, OP_COPY_STRIDE, p_copy_stride) = (p_copy_stride){st, 0, 0}; }
+/* The bytes between the 2D images of a 3D texture or an array copied to or from a buffer (0 = rows x row stride, packed);
+   Pokemon Pokopia calls it (seedds/nxnative records it the same way, MIT). nvn_mtl.m copy_b2t / copy_t2b. */
+NVN(nvnCommandBufferSetCopyImageStride, void, NVNcommandBuffer *c, ptrdiff_t st) { *REC(c, OP_COPY_STRIDE, p_copy_stride) = (p_copy_stride){st, 1, 0}; }
 NVN(nvnCommandBufferSetBlendColor, void, NVNcommandBuffer *c, const float *v) { memcpy(REC(c, OP_BLEND_COLOR, p_blend_color)->rgba, v, 16); }
 
 // ---------- 状态对象：就地打包（nvn_obj.h） ----------
@@ -2361,7 +2476,7 @@ void dm_gfx_suspend(int on) {
     if (on) while (g_inflight_api) pthread_cond_wait(&g_susp_cv, &g_susp_mu);
     else pthread_cond_broadcast(&g_susp_cv);
     pthread_mutex_unlock(&g_susp_mu);
-    if (on) { x_drain(); mtl_drain(); LOG("[nvn] 图形挂起：在途 GPU 工作已清空"); } else LOG("[nvn] 图形恢复");
+    if (on) { replay_enter(); mtl_drain(); replay_leave(); LOG("[nvn] 图形挂起：在途 GPU 工作已清空"); } else LOG("[nvn] 图形恢复");
 }
 _Atomic int dm_submit_busy;   // TOTK diagnostic: submissions being replayed (runtime/gfx_bridge.c write watch)
 // ---------- TOTK: translation thread (TOTK_ASYNC_REPLAY=1) ----------
@@ -2375,10 +2490,15 @@ _Atomic int dm_submit_busy;   // TOTK diagnostic: submissions being replayed (ru
 //    job of that image's last present, then for its present ticket as before. The replay frame number travels in the job.
 //  - Operations that destroy or read Metal state (pool / texture / program finalize, ReadTexels / WriteTexels, QueueFinish,
 //    suspend) wait until the queue is empty first (x_drain), so they never overtake a queued replay that still uses them.
-// TOTK_ASYNC_REPLAY=0 runs everything on the calling thread as before. Default on since 2026-10-21: the NX Optimizer
-// benchmark (bench_run.py) kept its average and raised the 1% / 0.1% lows from 35 / 27 to 38-39 / 30-31 fps, and the
-// 94-frame picture comparison with citron showed no difference from the synchronous replay. On the Mac only: the iPhone
-// and iPad keep the synchronous replay unless TOTK_ASYNC_REPLAY=1 (not measured there).
+// Off by default for every game on every platform since 2026-11-03 (TOTK_ASYNC_REPLAY=1 turns it on). It was on for the
+// Mac's non-Breath-of-the-Wild games from 2026-10-21 on one contributor's benchmark (1% / 0.1% lows 35 / 27 -> 38-39 /
+// 30-31 fps; runs, spread and cache state not given, never reproduced). Measured again 2026-11-03, Tears of the Kingdom
+// 1.4.3, the Lookout Landing walk and flights to Kakariko and Hateno, 1920x1080, one warm cache, off / on alternating,
+// three runs each: frame p50 off 12.15 / 11.88 / 11.84 ms, on 12.27 / 12.12 / 12.48; p95 off 13.96 / 13.98 / 14.12, on
+// 14.23 / 17.01 / 14.32; frames over 50 ms without new pipelines off 4 / 20 / 16, on 12 / 16 / 13. The replay takes
+// ~6 ms a frame and the GPU ~9.5 ms, so the overlap has at most ~2.5 ms to win, and none showed. Synchronous replay is
+// one thread fewer and simpler to debug (the user's choice). Breath of the Wild: off since 2026-10-27 (1.6.0 Hebra 9.30 /
+// 9.08 ms with it against 9.09 / 8.96 without).
 enum { XJ_SUBMIT = 1, XJ_PRESENT, XJ_TEXREL };
 typedef struct { int kind, n; uint64_t *h; void *ucap; win_t *win; int idx; double period; int crop[4]; uint64_t frame, sub; tex_t tex; } xjob;   // tex: copy of a finalized texture (XJ_TEXREL); ucap: uniforms captured at the submit call
 #define XQ 64
@@ -2391,11 +2511,29 @@ static win_t *g_xp_win; static uint64_t g_xp_job[4];   // job number of each swa
 static _Atomic uint64_t g_x_drains, g_x_drain_ns;
 static int async_replay(void) {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("TOTK_ASYNC_REPLAY"); v = e ? atoi(e) > 0 : TARGET_OS_OSX && !TOTK_BOTW_BUILD;   /* Breath of the Wild: off, 2026-10-27 1.6.0 Hebra 9.30 / 9.08 ms against 9.09 / 8.96 without it, no gain; =1 turns it on */ if (v) LOG("[nvn] 翻译线程：提交与出图排队交给独立线程回放（TOTK_ASYNC_REPLAY=0 关）"); }
+    if (v < 0) { const char *e = getenv("TOTK_ASYNC_REPLAY"); v = e && atoi(e) > 0;   /* off by default (2026-11-03 measurements above); =1 turns it on */ if (v) LOG("[nvn] 翻译线程：提交与出图排队交给独立线程回放（TOTK_ASYNC_REPLAY=1 开着；默认关）"); }
     return v;
 }
 static void submit_exec(int n, const uint64_t *h, void *ucap);
 static void present_exec(win_t *o, int idx, double period, const int crop[4], uint64_t frame);
+/* The replay section. With the translation thread (TOTK_ASYNC_REPLAY=1) every replay runs on it in order, and an operation
+   that reads or changes Metal state from a game thread first waits for it to be idle (x_drain). With synchronous replay
+   (the default since 2026-11-04) replays run on the threads that submit: the section is a lock instead, held across
+   each submit, present and such operation, and the thread holding it is the replay's own thread (the upload batch's
+   owner, nvn_mtl.m mtl_take_submit_thread). Donkey Kong Bananza submits from two threads: without it their replays
+   overlapped ("提交重入") and a memory-pool write-back on one thread used the other's upload batch. Recursive: a write-back
+   inside a replay (the same thread) enters it again. The guest's virtual core is given back while it waits. */
+static pthread_mutex_t g_sync_replay_mu = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
+void mtl_take_submit_thread(void);   // nvn_mtl.m
+static int async_replay(void);
+static void replay_enter(void) {
+    if (async_replay()) { x_drain(); return; }
+    { NVN_BLOCKING(); pthread_mutex_lock(&g_sync_replay_mu); }
+    mtl_take_submit_thread();
+}
+static void replay_leave(void) { if (!async_replay()) pthread_mutex_unlock(&g_sync_replay_mu); }
+void nvn_replay_enter(void) { replay_enter(); }   // for the graphics layer (memory-pool write-back)
+void nvn_replay_leave(void) { replay_leave(); }
 static _Thread_local int t_on_x_thread;   // set on the translation thread: x_drain there would wait for itself
 static void *x_thread(void *unused) {
     (void)unused; pthread_setname_np("totk-translate"); t_on_x_thread = 1;
@@ -2508,9 +2646,12 @@ NVN(nvnCommandBufferFenceSync, void, NVNcommandBuffer *c, NVNsync *s, NVNsyncCon
 }
 /* A GPU-side wait on a sync: the host runs every queue's submissions in order on one Metal queue, so what the sync fences is
    always done before what follows (seedds/nxnative does the same). */
-NVN(nvnQueueWaitSync, NVNboolean, NVNqueue *q, const NVNsync *s) { (void)q; (void)s; return 1; }
+/* Recorded into a command buffer and replayed in order on the single Metal queue (as nvnCommandBufferWaitEvent): nothing to do
+   at the record but the queue trace */
+NVN(nvnCommandBufferWaitSync, void, NVNcommandBuffer *c, const NVNsync *s) { qtrace("cb-wait", c, (long)(uintptr_t)s, 0); }
+NVN(nvnQueueWaitSync, NVNboolean, NVNqueue *q, const NVNsync *s) { qtrace("queue-wait", q, (long)(uintptr_t)s, 0); return 1; }
 NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h) {
-    NVN_BLOCKING();
+    NVN_BLOCKING(); qtrace("submit", q, n, 0);
     if (runtime_frametrace_event) runtime_frametrace_event(8);
 #ifdef GAME_BOTW
     NVNcommandHandle mapped[64]; NVNcommandHandle *heap = n > 64 ? malloc(sizeof *heap * (size_t)n) : NULL;
@@ -2549,7 +2690,7 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
 #endif
         return;
     }
-    submit_exec(n, (const uint64_t *)h, NULL);
+    replay_enter(); submit_exec(n, (const uint64_t *)h, NULL); replay_leave();
     if (atomic_load(&g_fence_sync_used)) for (int i = 0; i < n; i++) fence_syncs((const uint8_t *)h[i], 0, mtl_last_fence(), 0);   /* without the translation thread: the fence the submit ended with */
     atomic_store(&g_sub_fence_prev, atomic_load(&g_sub_fence_last)); atomic_store(&g_sub_fence_last, mtl_last_fence());
     totk_tl(TL_SUB_OUT, 0, 0);
@@ -2625,7 +2766,6 @@ static void nvn_nop(void) {}
 // so a real call stops at the unimplemented stub. WaitSync/WaitEvent rely on in-order replay on the single Metal queue.
 static const char *const g_nops[] = {
     "nvnCommandBufferSetPatchSize",
-    "nvnCommandBufferWaitSync",
     "nvnCommandBufferSetShaderScratchMemory",
     "nvnCommandBufferWaitEvent",
     "nvnWindowFinalize",
@@ -2838,7 +2978,7 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     if (s) { static int old_sync = -1; if (old_sync < 0) { const char *e = getenv("TOTK_ACQ_SYNC"); old_sync = e && !strcmp(e, "old"); }
              int tok = 0; uint64_t v = old_sync ? fence_now(&tok) : 0;
              ((sync_t *)s)->fenced = tok ? 7 : 3; ((sync_t *)s)->fence = v; }
-    totk_tl(TL_ACQ_OUT, (uint64_t)*idx, 0);
+    totk_tl(TL_ACQ_OUT, (uint64_t)*idx, 0); qtrace("acquire", w, *idx, (long)(uintptr_t)s);
     return NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS;
 }
 #ifdef GAME_BOTW
@@ -3289,7 +3429,7 @@ static void present_exec(win_t *o, int idx, double period, const int crop[4], ui
 }
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     NVN_BLOCKING();
-    (void)q; win_t *o = (win_t *)w; o->presents++;
+    qtrace("present", q, idx, 0); win_t *o = (win_t *)w; o->presents++;
     if (runtime_frametrace_event) runtime_frametrace_event(9);
     totk_tl_frame(o->presents); totk_tl(TL_PRES_IN, (uint64_t)idx, 0);
     if (runtime_frame_step_update) runtime_frame_step_update(now_ns());
@@ -3326,7 +3466,9 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         j.frame = g_frame + 1;   // dump_frame below advances g_frame before mtl_set_frame
         uint64_t no = x_push(&j);
         if (idx >= 0 && idx < 4) { g_xp_win = o; g_xp_job[idx] = no; }
-    } else present_exec(o, idx, present_period(o) / 1e9, o->crop, 0);
+    } else { replay_enter(); present_exec(o, idx, present_period(o) / 1e9, o->crop, 0); replay_leave(); }
+    { static int fin = -1; if (fin < 0) { fin = getenv("TOTK_PRESENT_FINISH") != NULL; if (fin) LOG("[nvn] TOTK_PRESENT_FINISH: each present waits until its frame has run on the GPU (diagnostic)"); }
+      if (fin) { if (async_replay() && idx >= 0 && idx < 4) x_wait_job(g_xp_job[idx]); void mtl_finish(void); mtl_finish(); } }
     atomic_fetch_add(&g_nvn_ns, now_ns() - t0);
     uint64_t f = g_frame, ps, dr; mtl_stats(&ps, &dr);
     trow(f, "@present_guest_ticks", o->interval);

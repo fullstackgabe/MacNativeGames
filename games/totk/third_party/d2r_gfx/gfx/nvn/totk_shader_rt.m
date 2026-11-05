@@ -83,6 +83,8 @@ static _Atomic int64_t g_cached_variants = -1;
 
 static NSString *root_dir(void) {   // native-port/ (the executable lives in native-port/build/)
     if (g_root) return g_root;
+    const char *native = getenv("TOTK_NATIVE_DIR");   // the Mac app: its executable is Contents/MacOS/<name> (app/launcher.m)
+    if (native && *native) return g_root = [@(native) stringByDeletingLastPathComponent];
     char path[4096]; uint32_t n = sizeof path;
     if (_NSGetExecutablePath(path, &n)) die("executable path too long");
     g_root = [[[@(path) stringByResolvingSymlinksInPath] stringByDeletingLastPathComponent] stringByDeletingLastPathComponent];
@@ -96,10 +98,20 @@ NSString *totk_rt_dir(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         const char *e = getenv("TOTK_SHADER_CACHE");
+        NSString *cacheChain = @DMSH_CHAIN;
+        NSData *manifest = [NSData dataWithContentsOfFile:[seed_dir() stringByAppendingPathComponent:@"seed-manifest.json"]];
+        NSDictionary *metadata = manifest ? [NSJSONSerialization JSONObjectWithData:manifest options:0 error:nil] : nil;
+        NSString *context = [metadata isKindOfClass:NSDictionary.class] ? metadata[@"translation_context_sha256"] : nil;
+        if ([context isKindOfClass:NSString.class] && context.length == 64 &&
+            [context rangeOfCharacterFromSet:[[NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdef"] invertedSet]].location == NSNotFound)
+            cacheChain = [cacheChain stringByAppendingFormat:@"-%@", context];
+#ifdef GAME_NS2
+        else cacheChain = [cacheChain stringByAppendingString:@"-nvn-default-depth-v1"];   // development runs without a seed
+#endif
 #if TARGET_OS_IPHONE
-        g_dir = e ? @(e) : [NSString stringWithFormat:@"shader-cache/rt-%s", DMSH_CHAIN];   // in Documents (the app's working directory)
+        g_dir = e ? @(e) : [NSString stringWithFormat:@"shader-cache/rt-%@", cacheChain];   // in Documents (the app's working directory)
 #else
-        g_dir = e ? @(e) : [root_dir() stringByAppendingFormat:@"/build/shader-cache/rt-%s", DMSH_CHAIN];
+        g_dir = e ? @(e) : [root_dir() stringByAppendingFormat:@"/build/shader-cache/rt-%@", cacheChain];
 #endif
         [NSFileManager.defaultManager createDirectoryAtPath:g_dir withIntermediateDirectories:YES attributes:nil error:nil];
         const char *seedMode = getenv("TOTK_SHADER_SEED");
@@ -181,6 +193,20 @@ NSSet<NSString *> *totk_rt_observed_shader_keys(void) {
     return totk_shader_observed_keys(observed_keys_state());
 }
 
+/* A shader the game set (nvnProgramSetShaders) that the app's seed does not hold: its key goes into the player's
+   contribution file once as a V row of the default bind state ("V <key> {}"), so the game's shared list names it and the
+   next build translates it ahead (prepare_ns2_seed.py takes the RDB shaders the list names). Pokemon Pokopia sets about
+   8,000 of its 131,000 shaders while it loads; the list started from those one run met (2026-11-04). Nothing without a
+   seed scope (a development run) or without a contribution file. */
+void totk_rt_note_set(NSString *shader) {
+    static NSSet<NSString *> *seeded; static NSMutableSet<NSString *> *noted; static dispatch_once_t once;
+    dispatch_once(&once, ^{ NSArray *k = shader_scope()[@"keys"]; seeded = [k isKindOfClass:NSArray.class] ? [NSSet setWithArray:k] : nil;
+                            noted = [NSMutableSet set]; });
+    if (!seeded || [seeded containsObject:shader]) return;
+    pthread_mutex_lock(&g_rt_lock);   // totk_contrib_add is called under the translation lock
+    if (![noted containsObject:shader]) { [noted addObject:shader]; totk_contrib_add(shader, @{}); }
+    pthread_mutex_unlock(&g_rt_lock);
+}
 NSSet<NSString *> *totk_rt_shader_scope(void) {
     const char *all = getenv("TOTK_WARM_ALL");
     NSDictionary *scope = shader_scope();
@@ -614,6 +640,7 @@ static void urgent_translate(NSString *shader, NSMutableArray *job) {
 }
 /* Translation jobs queued or running (seed-shaders waits for none to be left). */
 int totk_rt_pending(void) { pthread_mutex_lock(&g_rt_lock); int n = (int)g_rt_pending.count; pthread_mutex_unlock(&g_rt_lock); return n; }
+int totk_rt_pending_of(NSString *shader) { pthread_mutex_lock(&g_rt_lock); int n = g_rt_pending[shader] != nil; pthread_mutex_unlock(&g_rt_lock); return n; }
 void totk_rt_urgent_stats(uint64_t *n, uint64_t *ns) { *n = atomic_load(&g_rt_urgent_n); *ns = atomic_load(&g_rt_urgent_ns); }
 
 /* What the submit thread spends on translation itself (may_defer 0): waiting for a job already running

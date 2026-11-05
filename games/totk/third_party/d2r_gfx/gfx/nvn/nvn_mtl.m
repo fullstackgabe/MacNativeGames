@@ -702,6 +702,7 @@ void mtl_init(void) {
     g_ev = [g_dev newSharedEvent];
     g_keep = [NSMutableArray array];
     g_nvn_deswz_gpu = nvn_deswz_gpu_init(g_dev) == 0;
+    if (getenv("TOTK_DESWZ_CPU")) { g_nvn_deswz_gpu = 0; MLOG("TOTK_DESWZ_CPU: swizzled textures are laid out on the CPU (diagnostic)"); }
     dm_res_report_register(mtl_res_counts);
     if (!g_nvn_deswz_gpu) MLOG("【红】显卡解排布初始化失败，预排布贴图回退 CPU");
     MLOG("Metal 设备 %s", g_dev.name.UTF8String);
@@ -1107,6 +1108,9 @@ static void up_flush(void);
 // and on mismatch prints the stack and aborts on the spot - so that 'another thread touched the batch' is exposed deterministically on Mac too, not by timing (real iOS device stuck at the main menu: the present thread flushed the submit thread's batch via q_cb).
 static pthread_t g_sub_thread; static _Atomic int g_sub_thread_set;
 static int on_sub_thread(void) { return atomic_load(&g_sub_thread_set) && pthread_equal(pthread_self(), g_sub_thread); }
+/* Synchronous replay: the thread in the replay section (hle_nvn.c replay_enter) is the batch's owner for what it does
+   there (a memory-pool write-back, ReadTexels); a submission sets it again at mtl_sub_begin. */
+void mtl_take_submit_thread(void) { g_sub_thread = pthread_self(); atomic_store(&g_sub_thread_set, 1); }
 static void up_owner_check(const char *where) {
     if (!atomic_load(&g_sub_thread_set) || on_sub_thread()) return;
     char name[64] = ""; pthread_getname_np(pthread_self(), name, sizeof name);
@@ -1458,6 +1462,7 @@ static inline void enc_r_vbuf(id<MTL4RenderCommandEncoder> e, NSUInteger i, uint
 static inline void enc_r_args(id<MTL4RenderCommandEncoder> e, MTLRenderStages s, uint64_t gpu, NSUInteger i) { enc_r_address(e, s == MTLRenderStageVertex ? 0 : 1, i, gpu); }
 static inline void enc_r_draw(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger v, NSUInteger n) { if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_DRAW,.u={p,v,n}},1); else [e drawPrimitives:p vertexStart:v vertexCount:n]; }
 static inline void enc_r_draw_instanced(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger v, NSUInteger n, NSUInteger i, NSUInteger b) { if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_INSTANCED,.u={p,v,n,i,b}},1); else [e drawPrimitives:p vertexStart:v vertexCount:n instanceCount:i baseInstance:b]; }
+static inline void enc_r_draw_indirect(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, uint64_t ind) { if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_INDIRECT,.u={p,ind}},1); else [e drawPrimitives:p indirectBuffer:ind]; }
 static inline void enc_r_draw_indexed_indirect(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, MTLIndexType t, uint64_t gpu, NSUInteger len, uint64_t ind) { if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_INDEXED_INDIRECT,.u={p,t,gpu,len,ind}},1); else [e drawIndexedPrimitives:p indexType:t indexBuffer:gpu indexBufferLength:len indirectBuffer:ind]; }
 static inline void enc_r_draw_indexed(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger n, MTLIndexType t, uint64_t gpu, NSUInteger len, NSUInteger i, NSInteger bv, NSUInteger bi) { if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_INDEXED,.u={p,n,t,gpu,len,i,(uint64_t)bv,bi}},1); else [e drawIndexedPrimitives:p indexCount:n indexType:t indexBuffer:gpu indexBufferLength:len instanceCount:i baseVertex:bv baseInstance:bi]; }
 static inline void enc_r_store(id<MTL4RenderCommandEncoder> e, int depth, MTLStoreAction action, NSUInteger index) { if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_STORE,.u={(uint64_t)depth,action,index}},0); else if (depth == 1) [e setDepthStoreAction:action]; else if (depth == 2) [e setStencilStoreAction:action]; else [e setColorStoreAction:action atIndex:index]; }
@@ -3038,6 +3043,10 @@ void mtl_wb_eager(void) {
     wb_write_list(list, nl, 1);
 }
 void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
+    { static long from = -1; static int left = 12; if (from < 0) { const char *e = getenv("TOTK_INV_LOG"); from = e ? atol(e) : 0; if (e && !from) from = 1; }
+      if (from > 0 && (long)atomic_load(&g_cur_frame) >= from && left > 0) { left--;
+          MLOG("[inv] f%llu call pool %p mem %p range +%#llx %#llx, write-back %s, %u renderings tracked", (unsigned long long)atomic_load(&g_cur_frame), (const void *)p, p ? (void *)p->mem : NULL,
+               (unsigned long long)off, (unsigned long long)n, atomic_load(&g_wb_on) ? "on" : "off", g_wb.n); } }
     if (!p || !p->mem || !atomic_load(&g_wb_on)) return;
     pthread_mutex_lock(&g_smu);
     if (!g_wb.n) { pthread_mutex_unlock(&g_smu); return; }
@@ -3049,6 +3058,10 @@ void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
         uint64_t k = e->t.serial; nvn_hm_del(&g_wb, &k); list[nl++] = e; i = (uint32_t)-1;   // deletion shifts entries: rescan
     }
     pthread_mutex_unlock(&g_smu);
+    { static long from = -1; static int left = 30; if (from < 0) { const char *e = getenv("TOTK_INV_LOG"); from = e ? atol(e) : 0; if (e && !from) from = 1; }   // TOTK_INV_LOG=<from frame> (diagnostic)
+      if (from > 0 && (long)atomic_load(&g_cur_frame) >= from && left > 0) { left--; char sers[256] = ""; size_t o = 0;
+          for (int i = 0; i < nl && o < 220; i++) o += snprintf(sers + o, sizeof sers - o, " %llu", (unsigned long long)list[i]->t.serial);
+          MLOG("[inv] f%llu range %p+%#llx: %d renderings written back:%s", (unsigned long long)atomic_load(&g_cur_frame), (void *)a, (unsigned long long)n, nl, sers); } }
     wb_write_list(list, nl, 0);
 }
 /* A memory pool is finalized: pending renderings into its bytes are dropped. The game has given the range back to its
@@ -3115,7 +3128,10 @@ static void wb_write_list(wb_ent **list, int nl, int force) {
     if (!nl) return;
     int tl = totk_tl_on(), blit = 0;
     if (tl) { totk_tl(TL_WB_IN, (uint64_t)nl, 0); for (int i = 0; i < nl; i++) blit |= !BOTW_WB_IS_STAGED(list[i]); }
+    extern void nvn_replay_enter(void) __attribute__((weak)), nvn_replay_leave(void) __attribute__((weak));   // hle_nvn.c: the replay section (uploads, the batch)
+    if (nvn_replay_enter) nvn_replay_enter();
     @autoreleasepool { wb_write_list_body(list, nl, force); }
+    if (nvn_replay_leave) nvn_replay_leave();
     if (tl) totk_tl(TL_WB_OUT, (uint64_t)nl, (uint64_t)blit);
 }
 /* Cache maintenance can reach these waits without an NVN_BLOCKING entry point. Keeping the guest's virtual core
@@ -3985,23 +4001,30 @@ static id<MTLTexture> reup_take(const reup_key *k) {
     if (hit) g_reup_reused++;
     return hit;
 }
-/* TOTK (iPhone): Metal copies of large mipmapped CPU-pool textures leave out the top level: a quarter of the memory. The
+/* Optional Mac diagnostic: Metal copies of large mipmapped CPU-pool textures leave out the top level: a quarter of the memory. The
    game samples them with normalised coordinates, so a texture one level smaller is drawn from what was its level 1 (on
    the 720p handheld screen most of them are minified anyway). Texture-ID views shift their level range (tex_by_id);
    a copy the GPU starts rendering into is uploaded again at full size (tex_mtl). 2D / 2D-array / cube textures with
    at least two levels and both sides >= TOTK_MIP_DROP_MIN (512). Not lower: at 256 the grass disappeared and the ground
    took wrong colours on an iPhone 14 (2026-10-23): data textures of that size (terrain material / grass maps) are read
-   by integer texel coordinates, which a copy one level smaller does not match. TOTK_MIP_DROP=0 off, =1 on (default on
-   iOS only). */
+   by integer texel coordinates, which a copy one level smaller does not match. TOTK_MIP_DROP=1 opts in on the Mac.
+   iOS always preserves the original dimensions and all mip levels, just like the Mac's default (2026-11-04). In particular,
+   texture-copy commands use the game's original mip indices and texel regions; a smaller sampled copy cannot represent them. */
 static uint64_t g_mip_dropped;
 static unsigned mip_drop_of(const tex_t *t) {
+#if TARGET_OS_IPHONE
+    (void)t;
+    static int noted; if (!noted) { noted = 1; MLOG("[texture] iOS: original texture dimensions and complete mip chains"); }
+    return 0;
+#else
     static int on = -1; static unsigned minside;
-    if (on < 0) { const char *e = getenv("TOTK_MIP_DROP"), *m = getenv("TOTK_MIP_DROP_MIN"); on = e ? atoi(e) != 0 : TARGET_OS_IPHONE; minside = m ? (unsigned)atoi(m) : 512;
+    if (on < 0) { const char *e = getenv("TOTK_MIP_DROP"), *m = getenv("TOTK_MIP_DROP_MIN"); on = e ? atoi(e) != 0 : 0; minside = m ? (unsigned)atoi(m) : 512;
         if (on) MLOG("大贴图副本少传最高一级 mip：开（两边都 ≥%u 的 2D / 数组 / 立方体贴图；TOTK_MIP_DROP=0 关）", minside); }
     if (!on || g_mip_nodrop || g_mip_keep) return 0;
     uint32_t g = t->d.target;
     if (!(g == 1 || g == 4 || g == 7 || g == 8 || g == 9) || t->d.levels < 2 || t->d.width < minside || t->d.height < minside) return 0;
     return 1;
+#endif
 }
 static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, reup_key *key, NvPkg *pk) {
     MTLTextureDescriptor *d = tex_desc(t, t->has_layout);   // TOTK: default-layout mirrored textures keep render-target usage
@@ -4256,6 +4279,11 @@ static void *tex_mtl_p(const tex_t *ct) {
                 if (clean) return (__bridge void *)pk->tex;
             }
             TILELOG(t, "re-upload from the pool bytes");
+            { static long on = -1; static uint64_t seen[64]; static uint32_t cnt[64]; static int ns;   // TOTK_REUP_LOG=<from frame> (diagnostic): which textures the pool's changes re-upload
+              if (on < 0) { const char *e = getenv("TOTK_REUP_LOG"); on = e ? atol(e) : 0; if (e && !on) on = 1; }
+              if (on > 0 && (long)atomic_load(&g_cur_frame) >= on) { int k = 0; while (k < ns && seen[k] != t->serial) k++; if (k == ns && ns < 64) { seen[ns] = t->serial; cnt[ns++] = 0; }
+                  if (k < 64 && (cnt[k]++ % 100) == 0) MLOG("[reup] f%llu ser=%llu %ux%u fmt=%#x lv%u mem=%p size=%#llx owned=%d hashed=%d (%u times)", (unsigned long long)atomic_load(&g_cur_frame),
+                      (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, t->d.levels, (void *)t->mem, (unsigned long long)t->L.size, pk->owned, pk->hashed, cnt[k]); } }
             uint64_t st; BOTW_PKG_WB_TAKE() reup_key nk; g_mip_nodrop = pk->owned; g_mip_keep = pk->keep_full; id<MTLTexture> nt = pkg_upload(t, &st, &nk, pk); g_mip_nodrop = 0; g_mip_keep = 0;   // 池内容变了（流式素材写进同一存储）：换新贴图，在途绘制仍读旧的 | Pool content changed (streamed assets written into the same storage): switch to a new texture; in-flight draws still read the old one
             if (nt) { id<MTLTexture> old = pk->tex; pk->tex = nt; reup_retire(old, &pk->key); pk->key = nk; if (pk->hashed) pk->chash = h; ser_bump(t->serial); pk->stamp = st; pk->seen = st; BOTW_PKG_WB_SET(pk) g_pkg_reuploads++; if (dirtycheck()) pk->hash = full_hash(t->mem, t->L.size); BOTW_REUP_TRACKED(pk, t) }
             else { free(pk->edge); pk->edge = NULL; }   // TOTK (#90): the bytes kept belong to the upload that failed
@@ -5430,6 +5458,8 @@ static NSMutableDictionary<NSString *, NSString *> *g_shmap;
 static NSMutableDictionary<NSString *, NSString *> *g_shassets;
 static NSString *g_shmap_path, *g_msl_dir;
 static NSString *exe_rel(const char *rel) {
+    const char *native = getenv("TOTK_NATIVE_DIR");   // the Mac app: its executable is Contents/MacOS/<name> (app/launcher.m)
+    if (native && *native) return [NSString stringWithFormat:@"%@/%@", @(native), @(rel)];
     char buf[4096]; uint32_t n = sizeof buf;
     if (_NSGetExecutablePath(buf, &n)) return nil;
     char *dir = dirname(buf);
@@ -6253,6 +6283,7 @@ static void prog_stage_set(NvProg *o, int st, NSString *variant) {   // a transl
     o->sh[st]=sh; o->sig[st]=stage_sig(st); o->alt[st]=[NSMutableDictionary dictionaryWithObject:sh forKey:@(o->sig[st])];
 }
 static int g_prog_prefetch;   // prog_get called by shader_predict_rest: every stage is translated in the background
+static int prog_timing_on(void); static void prog_timing(const char *what, const prog_t *p, unsigned i, int st, const char *key);   // TOTK_PROG_TIMING (below)
 static void shader_predict_maybe(void);
 // The shader key: SHA-256 of the control section and the code, in hex (prog_get; prediction of unseen programs).
 static void shader_key_of(const uint8_t *control, const void *code, uint32_t length, char key[65]) {
@@ -6291,6 +6322,7 @@ static void *prog_get_p(const prog_t *cp) {   // 只在提交线程调用 | Call
         char key[65];shader_key_of(control,(const void *)(uintptr_t)p->sd[i].data,length,key);
         // TOTK: stage from control+0x714 (0 vertex, 1 fragment, 5 compute); translation answered from the bound state.
         int st=(int)nvn_stage;
+        if (prog_timing_on()) prog_timing("draw", p, i, st, key);
 #ifdef GAME_NS2
         /* A Switch 2 game's geometry / tessellation stages have no translation chain yet (Donkey Kong Bananza: 7 geometry
            shaders, drawn as mesh geometry by seedds/nxnative; docs/ns2-port.md phase 5): the program's draws are skipped
@@ -6632,8 +6664,13 @@ static MTLTextureType ttype(int target, int fallback) {
 // 贴图池容量 15256），从不登记该号。按 D3D / 空槽语义读出 0（与未绑同一套全零哑贴图），不报红；池内未登记的号仍报红
 // Out-of-pool texture ID = empty slot: the game itself uses GetSeparateTextureHandle(0xFFFFF) to get a handle and bind it to unused slots (measured call site main+0x1746820,
 // texture pool capacity 15256) and never registers that ID. Read 0 per D3D / empty-slot semantics (the same all-zero dummy textures as unbound), no failure; unregistered IDs inside the pool are still reported a failure
-static int g_tpool_n; static uint64_t g_stat_tex_oob;
-void mtl_set_tex_pool_n(int n) { g_tpool_n = n; }
+/* A texture ID indexes the texture pool the command buffer has bound (nvnCommandBufferSetTexturePool), as on hardware: an ID
+   past that pool's descriptors names nothing and reads 0. The capacity is the bound pool's, taken at replay with the draw
+   state (S.tex_pool_n). It was the last pool initialised: Pokemon Pokopia makes three (33,024, 16,640 and 4,352
+   descriptors), registers its textures in the first up to ID 32,992 and inits the 4,352 one last, so every texture from
+   ID 4,352 on read as an empty slot and most frames were black (2026-11-03). */
+static uint64_t g_stat_tex_oob;
+static int bound_tex_pool_n(void);   // after S
 /* DM_NVN_LIFELOG (see totk_lifelog.h): the texture the replay resolves for a followed texture-pool id, once per frame and id. */
 static void life_use(int tid, const tex_t *t, const char *how) {
     static uint64_t frame = ~0ull; static int seen[64]; static int nseen;
@@ -6652,7 +6689,7 @@ static uint8_t treg_kind(const tex_t *t) { return tex_mirrored(t) ? (pkg_hashed(
    retain + autorelease (an autorelease-pool entry) on the texture slow path. */
 #define tex_by_id(tid) ((__bridge id<MTLTexture>)tex_by_id_p(tid))
 static void *tex_by_id_p(int tid) {   // 调用方持 g_rmu | Caller holds g_rmu
-    if (g_tpool_n && tid >= g_tpool_n) { if (!g_stat_tex_oob++) MLOG("池外贴图号 %d（池容量 %d）按空槽处理：读出 0", tid, g_tpool_n); return NULL; }
+    { int pn = bound_tex_pool_n(); if (pn && tid >= pn) { if (!g_stat_tex_oob++) MLOG("池外贴图号 %d（绑定的池容量 %d）按空槽处理：读出 0", tid, pn); return NULL; } }
     if (tid < 0 || tid >= g_ntreg || !g_treg[tid].ok) { RED_ONCE(10, "贴图号 %d 未登记", tid); return NULL; }
     treg_t *rp = &g_treg[tid];
     rp->used = g_sub_serial;   // TOTK: the fast path below never reaches tex_mtl; pkg_evict_sweep reads this
@@ -6956,8 +6993,10 @@ static struct {
     uint64_t tex_gen[6];   // TOTK: a fresh value of g_tex_gen_seq whenever tex[stage] changes (TEX_CHANGED); saved / restored with S
     uint32_t st_vmask[2], st_wmask[2], st_ref[2];
     p_poly_offset po; float vp[16][4]; float dr[2]; int has_vp; int depth_clamp; int render_disabled; int raster_discard; uint8_t push[2][NVN_PUSH_SIZE];
-    float blend_color[4]; int64_t copy_stride;
+    float blend_color[4]; int64_t copy_stride, copy_image_stride;   // SetCopyRowStride / SetCopyImageStride (0 = packed)
+    int tex_pool_n;   // end of the bound texture pool's part of the ID table (its base + descriptors; OP_SET_TEX_POOL); 0 before one is bound: no bound check
 } S;
+static int bound_tex_pool_n(void) { return S.tex_pool_n; }
 static void args_program_changed(void);
 /* Separable programs: a draw's stages may come from several programs, each bound for its own stages (Pokemon Pokopia
    binds a vertex-only and a fragment-only program). When they are not all one program, the draw's program is a combined
@@ -7829,27 +7868,29 @@ static id<MTLFunction> fs_fn_border_with(NvShader *fs, int nodepth, NSString *bk
 /* The fragment function reading the given attachments from the tile (nvn_fbread.h), nil when it cannot be made. Built on
    the submit thread when a draw first needs it, never in the background: the draw has given up the store before it
    (att_fb_take), so it cannot be drawn with the plain function meanwhile. */
-static id<MTLFunction> fs_fn_fbread_slow(NvShader *fs, const int aid[], const int att[], int n);
-static id<MTLFunction> fs_fn_fbread(NvShader *fs, const int aid[], const int att[], int n) {
+static id<MTLFunction> fs_fn_fbread_slow(NvShader *fs, const int aid[], const int att[], int n, BOOL hdr);
+static id<MTLFunction> fs_fn_fbread(NvShader *fs, const int aid[], const int att[], int n, BOOL hdr) {
     if (!fs || !sh_has_src(fs) || n <= 0) return nil;   // a depth-writing shader keeps its depth output: callers draw it only into a pass with a depth plane (att_fb_take)
     /* TOTK: the decals ask for the same variant draw after draw; formatting the key and the dictionary lookup were ~2% of
        the translate thread at Kakariko (2026-10-25). The last four answers per thread (the warm-up asks from its own). */
-    typedef struct { const void *fs; int n, aid[8], att[8]; __unsafe_unretained id<MTLFunction> fn; } fbr_memo;   // fs retained: no reuse of its address; it holds fn in bpatch
+    typedef struct { const void *fs; BOOL hdr; int n, aid[8], att[8]; __unsafe_unretained id<MTLFunction> fn; } fbr_memo;   // fs retained: no reuse of its address; it holds fn in bpatch
     static __thread fbr_memo memo[4]; static __thread unsigned next;   // a few decal shaders alternate draw after draw
     for (int i = 0; i < 4; i++) { fbr_memo *e = &memo[i];
-        if (e->fs == (__bridge const void *)fs && e->n == n && !memcmp(aid, e->aid, sizeof *aid * (size_t)n) && !memcmp(att, e->att, sizeof *att * (size_t)n)) return e->fn; }
-    id<MTLFunction> got = fs_fn_fbread_slow(fs, aid, att, n);
+        if (e->fs == (__bridge const void *)fs && e->hdr == hdr && e->n == n && !memcmp(aid, e->aid, sizeof *aid * (size_t)n) && !memcmp(att, e->att, sizeof *att * (size_t)n)) return e->fn; }
+    id<MTLFunction> got = fs_fn_fbread_slow(fs, aid, att, n, hdr);
     if (got && n <= 8) { fbr_memo *e = &memo[next++ & 3];
         if (e->fs) CFRelease(e->fs);
-        e->fs = (__bridge_retained const void *)fs; e->n = n; memcpy(e->aid, aid, sizeof *aid * (size_t)n); memcpy(e->att, att, sizeof *att * (size_t)n); e->fn = got; }
+        e->fs = (__bridge_retained const void *)fs; e->hdr = hdr; e->n = n; memcpy(e->aid, aid, sizeof *aid * (size_t)n); memcpy(e->att, att, sizeof *att * (size_t)n); e->fn = got; }
     return got;
 }
-static id<MTLFunction> fs_fn_fbread_slow(NvShader *fs, const int aid[], const int att[], int n) {
-    NSMutableString *key = [NSMutableString stringWithString:@"fbread;"];
+static id<MTLFunction> fs_fn_fbread_slow(NvShader *fs, const int aid[], const int att[], int n, BOOL hdr) {
+    NSMutableString *key = [NSMutableString stringWithString:hdr ? @"hdr-fbread;" : @"fbread;"];
     for (int i = 0; i < n; i++) [key appendFormat:@"%d:%d;", aid[i], att[i]];
     os_unfair_lock_lock(&g_bpatch_lock); id fn = fs->bpatch[key]; os_unfair_lock_unlock(&g_bpatch_lock);
     if (fn) return fn == VARIANT_NONE ? nil : fn;
-    NSString *src = nvn_fbread_src(sh_src(fs), fs->fn.name, aid, att, n);
+    // The tile-read function replaces the fragment function for this draw, so derive it from the active tone map.
+    NSString *base = hdr ? fn_src(fs->hdr_fn) : sh_src(fs);
+    NSString *src = nvn_fbread_src(base, fs->fn.name, aid, att, n);
     CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();   // about 90 ms cold on an M4 Max; Metal's cache keeps it, and the next packaging compiles it into the app (variant_library)
     NSError *err = nil; id<MTLLibrary> lib = src ? variant_library(src, &err) : nil;
     fn = lib ? [lib newFunctionWithName:fs->fn.name] : nil;
@@ -8231,10 +8272,8 @@ static id<MTLRenderPipelineState> pso_new(MTLRenderPipelineDescriptor *d, NSStri
     if (ps) par_add(g_dev, key, d);
     return ps;
 }
-static id<MTLComputePipelineState> cs_new(NvShader *cs, NSError **e) {
-    if (!cs || !cs->fn) return nil;
+static id<MTLComputePipelineState> cs_new_(NvShader *cs, MTLComputePipelineDescriptor *d, NSError **e) {
     NSString *key = cs_archive_key(cs);
-    MTLComputePipelineDescriptor *d = [MTLComputePipelineDescriptor new]; d.computeFunction = cs->fn;
     id<MTLComputePipelineState> ps = nil;
     id<MTLBinaryArchive> a = par_archive_for(g_dev, key);
     if (a) {
@@ -8242,10 +8281,31 @@ static id<MTLComputePipelineState> cs_new(NvShader *cs, NSError **e) {
         ps = [g_dev newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionFailOnBinaryArchiveMiss reflection:nil error:nil];
         par_pre_note(ps != nil);
         if (ps) { par_count(1); return ps; }
+        d.binaryArchives = nil;
     }
     if (g_par_on) par_count(0);
     ps = [g_dev newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionNone reflection:nil error:e];
     if (ps) par_add(g_dev, key, d);
+    return ps;
+}
+/* A compute pipeline that takes the shader's own thread group size. Metal compiles a kernel for some number of threads a group
+   (maxTotalThreadsPerThreadgroup, lower when it needs many registers), and a dispatch with more threads a group is invalid.
+   Such a kernel is built again with the group size in its descriptor, so the compiler fits it to that many threads (spilling
+   registers if it must). Only then: a descriptor that names the size is another pipeline to the binary archives, which hold
+   the kernels as built without it. (Checked while looking for Pokemon Pokopia's GPU hang, 2026-11-03: its 32 x 32 kernel
+   70ab27e1 fits as built; the hang was a translator bug, patch 0006 AHalfSecond.) */
+static id<MTLComputePipelineState> cs_new(NvShader *cs, NSError **e) {
+    if (!cs || !cs->fn) return nil;
+    MTLComputePipelineDescriptor *d = [MTLComputePipelineDescriptor new]; d.computeFunction = cs->fn;
+    id<MTLComputePipelineState> ps = cs_new_(cs, d, e);
+    NSUInteger group = (NSUInteger)cs->rf.tg[0] * cs->rf.tg[1] * cs->rf.tg[2];
+    if (!ps || group <= ps.maxTotalThreadsPerThreadgroup) return ps;
+    NSUInteger had = ps.maxTotalThreadsPerThreadgroup;
+    d = [MTLComputePipelineDescriptor new]; d.computeFunction = cs->fn; d.maxTotalThreadsPerThreadgroup = group;
+    ps = cs_new_(cs, d, e);
+    MLOG("[shader] compute shader %s: %lu threads a group, %lu as first built; built again for the group: %lu", cs->key, (unsigned long)group,
+         (unsigned long)had, ps ? (unsigned long)ps.maxTotalThreadsPerThreadgroup : 0ul);
+    if (ps && group > ps.maxTotalThreadsPerThreadgroup) { MLOG("[RED] compute shader %s cannot run %lu threads a group (%lu): its dispatches are skipped", cs->key, (unsigned long)group, (unsigned long)ps.maxTotalThreadsPerThreadgroup); return nil; }
     return ps;
 }
 static char pfmt_class(MTLPixelFormat f) {   // 'u' / 's' pure unsigned / signed integer colour format, 'f' any other, 0 none
@@ -8703,7 +8763,7 @@ static void *pso_get_p(NvProg *pr, MTLRenderPassDescriptor *unused) {
     /* A tile-reading pipeline (att_fb_take) was recorded only as its plain R row, so the warm-up never built it and every
        session compiled it in play: about 4,750 pipelines per UltraCam run, frames of 0.3-1 s (2026-10-24). Its T row names
        the variant (aid:att pairs) so the warm-up builds it into the archive (warm_tileread). */
-    if (fbread && g_pso_fbrec[0] && !(k.a2c & PSO_VBORDER)) {
+    if (fbread && !hdr && g_pso_fbrec[0] && !(k.a2c & PSO_VBORDER)) {
         pso_key rk = k; rk.fsfn = NULL; pso_skey tsk; char thex[sizeof tsk * 2 + 1]; pso_skey_from(&rk, vs, fs, 0, NULL, &tsk); pso_skey_hex(&tsk, thex);
         pso_user_record("T\t%s\t%s\n", thex, g_pso_fbrec);
         pso_contribute(&tsk, nil, @(g_pso_fbrec));
@@ -8897,16 +8957,44 @@ static void warm_enqueue(WarmItem *item) {
    the frames that stalled for a new library (65 of them, 181 libraries, 29 s in a 21-minute run) were all variants
    already in the cache, compiled from their MSL at the draw. Variants not in the cache, and pipelines, are still made
    at the draw as before. Nothing is translated here and no draw is skipped. */
-static int prefetch_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("TOTK_SHADER_PREFETCH"); on = e && !strcmp(e, "1"); } return on; }
-static _Atomic uint64_t g_pf_progs, g_pf_queued, g_pf_built, g_pf_ns, g_pf_last;
+/* TOTK_SHADER_PREFETCH=2: also the shaders the translation cache does not hold yet, translated in the background first
+   (totk_rt_variant may_defer 1: the code is copied at once) and then compiled the same way. A Switch 2 game makes many of
+   its shaders while it runs (Pokemon Pokopia: none of the 99 its first four minutes in the world translated in play is in
+   its files, so build_app.py cannot prepare them): their code is final when the game sets them (all 260 stages drawn in a
+   run had the key they had at SetShaders), 150 ms to 20 s before their first draw (TOTK_PROG_TIMING, 2026-11-04). */
+static int prefetch_mode(void) { static int on = -1; if (on < 0) { const char *e = getenv("TOTK_SHADER_PREFETCH"); on = e ? atoi(e) : 0; } return on; }
+static int prefetch_on(void) { return prefetch_mode() > 0; }
+static _Atomic uint64_t g_pf_progs, g_pf_queued, g_pf_built, g_pf_ns, g_pf_last, g_pf_translate;
+/* TOTK_PROG_TIMING=1 (diagnostic): each stage's shader key when the game sets a program's shaders and when a draw first
+   takes the program (prog_get), with the time, to see whether the code is final at SetShaders and how long before its
+   first draw it is (Pokemon Pokopia's shaders made at run time, 2026-11-04). "[progt] set|draw <ms> <program> <serial>
+   <stage> <key>" */
+static int prog_timing_on(void) { static int on = -1; if (on < 0) on = getenv("TOTK_PROG_TIMING") != NULL; return on; }
+static void prog_timing(const char *what, const prog_t *p, unsigned i, int st, const char *key) {
+    MLOG("[progt] %s %.1f %p %llu %d %.64s", what, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e6, (const void *)p, (unsigned long long)p->serial, st, key);
+}
 void mtl_prog_prefetch(const prog_t *p) {
+#ifdef GAME_NS2
+    const int note = 1;   // the shaders a Switch 2 game sets go to the shared list (totk_rt_note_set)
+#else
+    const int note = 0;
+#endif
+    if ((prog_timing_on() || note) && p) for (unsigned i = 0; i < p->nstage && i < 6; i++) {
+        const uint8_t *control = p->sd[i].control; const void *code = (const void *)(uintptr_t)p->sd[i].data;
+        if (!control || !code) continue;
+        uint32_t length = ctl_code_len(control); if (!length || length > 16 * 1024 * 1024) continue;
+        char key[65]; shader_key_of(control, code, length, key);
+        if (prog_timing_on()) prog_timing("set", p, i, ctl_stage(control, code), key);
+        if (note) totk_rt_note_set(@(key));
+    }
     if (!prefetch_on() || !p || !p->nstage) return;
     static NSMutableSet<NSString *> *seen; static dispatch_queue_t q; static dispatch_semaphore_t slots; static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT;
     static dispatch_once_t once; dispatch_once(&once, ^{
         seen = [NSMutableSet set];
         q = dispatch_queue_create("totk.shader-prefetch", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_CONCURRENT, QOS_CLASS_USER_INITIATED, 0));
         slots = dispatch_semaphore_create(4);   // the system compiler service runs requests side by side; 4 leaves cores to the game
-        MLOG("[prefetch] 着色器预编已开（TOTK_SHADER_PREFETCH=1）：游戏设着色器时，后台编翻译缓存里已有的变体，最多 4 个同时编");
+        MLOG("[prefetch] 着色器预编已开（TOTK_SHADER_PREFETCH=%d）：游戏设着色器时，后台编翻译缓存里已有的变体%s，最多 4 个同时编", prefetch_mode(),
+             prefetch_mode() > 1 ? "，缓存里没有的先在后台翻译" : "");
     });
     atomic_fetch_add(&g_pf_progs, 1);
     for (unsigned i = 0; i < p->nstage && i < 6; i++) {
@@ -8922,7 +9010,14 @@ void mtl_prog_prefetch(const prog_t *p) {
         os_unfair_lock_lock(&lk); BOOL fresh = ![seen containsObject:shader]; if (fresh) [seen addObject:shader]; os_unfair_lock_unlock(&lk);
         if (!fresh) continue;
         int stage = (int)st;
+        if (prefetch_mode() > 1 && !totk_rt_known_variants(shader).count) {   // not translated yet: queue it now (the code is copied there)
+            NSDictionary *none = @{@"tex": @{}, @"img": @{}, @"attr": @{}, @"fout": @{}};
+            totk_rt_variant(shader, stage, control, (const uint8_t *)(uintptr_t)p->sd[i].data, none, rt_local(control, stage), 1);
+            atomic_fetch_add(&g_pf_translate, 1);
+        }
         dispatch_async(q, ^{ @autoreleasepool {
+            if (prefetch_mode() > 1)   // a translation queued above: its library once it is done (background; at most 60 s)
+                for (int w = 0; w < 3000 && !totk_rt_known_variants(shader).count && totk_rt_pending_of(shader); w++) usleep(20000);
             for (NSString *v in totk_rt_known_variants(shader)) {
                 NSString *pc = [v stringByAppendingString:@"_b"];
                 if (warm_failed(pc)) continue;
@@ -8936,8 +9031,8 @@ void mtl_prog_prefetch(const prog_t *p) {
             }
             uint64_t now = bp_now(), last = atomic_load(&g_pf_last);
             if (now - last > 5000000000ull && atomic_compare_exchange_strong(&g_pf_last, &last, now))
-                MLOG("[prefetch] 累计：程序 %llu 个，排队编着色器 %llu 个，编好 %llu 个，后台共 %.0f ms",
-                     (unsigned long long)g_pf_progs, (unsigned long long)g_pf_queued, (unsigned long long)g_pf_built, g_pf_ns / 1e6);
+                MLOG("[prefetch] 累计：程序 %llu 个，排队翻译 %llu 个，排队编着色器 %llu 个，编好 %llu 个，后台共 %.0f ms",
+                     (unsigned long long)g_pf_progs, (unsigned long long)g_pf_translate, (unsigned long long)g_pf_queued, (unsigned long long)g_pf_built, g_pf_ns / 1e6);
         } });
     }
 }
@@ -9042,7 +9137,7 @@ static int warm_tileread(NSArray<NSString *> *c, NSMutableDictionary<NSString *,
         if (n == 8) return 0;
         aid[n] = q[0].intValue; att[n] = q[1].intValue; n++;
     }
-    id<MTLFunction> fn = n ? fs_fn_fbread(fs, aid, att, n) : nil;
+    id<MTLFunction> fn = n ? fs_fn_fbread(fs, aid, att, n, NO) : nil;
     if (!fn) return 0;
     pso_key k = sk.k; k.vs = (__bridge void *)vs; k.fs = (__bridge void *)fs; k.fsfn = (__bridge void *)fn;
     NSError *e = nil; uint64_t ps_started = bp_now();
@@ -9402,6 +9497,12 @@ static void warm_fill_archive(NSArray<NSString *> *paths, dispatch_semaphore_t d
         if (done) dispatch_semaphore_signal(done);   // after the line: the packaging tool's JSON report follows it on its own line
     });
 }
+static void offline_depth_mode(const char *depth) {
+    if (!depth || (strcmp(depth, "minus-w") && strcmp(depth, "zero"))) MDIE("offline shaders: depth mode must be minus-w or zero (the game's observed NVN mode)");
+    extern void totk_depth_set_near_minus_w(int);
+    totk_depth_set_near_minus_w(!strcmp(depth, "minus-w"));
+    MLOG("[seed] explicit NVN depth mode: %s", depth);
+}
 #if !TARGET_OS_IPHONE
 /* Packaging an iPhone / iPad app (ios/tools/build_ipa.py, 2026-10-29): `totk-native <rewritten> pipeline-archive <list>...`
    makes the pipelines of the lists from the device seed's metallibs (TOTK_SHADER_SEED_DIR, read in place;
@@ -9415,6 +9516,10 @@ static void warm_fill_archive(NSArray<NSString *> *paths, dispatch_semaphore_t d
 int mtl_pipeline_archive_tool(int argc, char **argv) {
     if (argc < 1 || !getenv("TOTK_SHADER_CACHE") || !getenv("TOTK_SHADER_SEED_DIR"))
         MDIE("pipeline-archive: TOTK_SHADER_CACHE=<folder> TOTK_SHADER_SEED_DIR=<device seed> totk-native <rewritten> pipeline-archive <list>...");
+    NSData *seedManifest = [NSData dataWithContentsOfFile:[@(getenv("TOTK_SHADER_SEED_DIR")) stringByAppendingPathComponent:@"seed-manifest.json"]];
+    NSDictionary *seedMetadata = seedManifest ? [NSJSONSerialization JSONObjectWithData:seedManifest options:0 error:nil] : nil;
+    if ([seedMetadata isKindOfClass:NSDictionary.class] && seedMetadata[@"nvn_depth_mode"])
+        offline_depth_mode([seedMetadata[@"nvn_depth_mode"] isKindOfClass:NSString.class] ? [seedMetadata[@"nvn_depth_mode"] UTF8String] : NULL);
     const char *host = getenv("TOTK_PIPELINE_ARCHIVE_HOST");
     /* Both on warm_threads() threads (8 on an M4; TOTK_WARM_THREADS=1 for one). The device's libraries went one at a time
        until 2026-11-01: Breath of the Wild 1.6.0's two runs for an iPad took 332 s + 187 s, on 8 threads 62 s + 49 s, with
@@ -10177,7 +10282,42 @@ static inline void cbc_ctx_now(cbc_ctx *c) {
 }
 static int ab_same_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_AB_SAME"); v = !(e && !atoi(e)); if (!v) MLOG("TOTK_AB_SAME=0: every rebuilt argument block gets a new copy"); } return v; }
 static inline unsigned cbc_slot(uint64_t addr, uint64_t size) { uint64_t h = (addr >> 4) ^ (addr >> 17) ^ (size * UINT64_C(0x9e3779b97f4a7c15)); return (unsigned)(h ^ (h >> 29)) & (CBC_N - 1); }
+/* TOTK_BIND_TRACE=<key prefix>[,<key prefix>...] (diagnostic): the first 24 encodes of those shaders name the texture
+   and image slots they read, as texture id -> serial and the Metal texture object (Pokemon Pokopia's exposure, 2026-11-03) */
+static void bind_trace(NvShader *sh, int nvn_stage) {
+    static char pre[8][17]; static int np = -1, left = 24;
+    if (np < 0) { const char *ne = getenv("TOTK_BIND_TRACE_N"); if (ne) left = atoi(ne); np = 0; for (const char *q = getenv("TOTK_BIND_TRACE"); q && *q && np < 8; ) { size_t n = strcspn(q, ","); snprintf(pre[np++], 17, "%.*s", (int)(n < 16 ? n : 16), q); q += n; if (*q) q++; } }
+    static long from = -1; if (from < 0) { const char *e = getenv("TOTK_BIND_TRACE_FROM"); from = e ? atol(e) : 0; }   // from that frame on
+    if (!np || left <= 0 || (long)atomic_load(&g_cur_frame) < from) return;
+    int hit = 0; for (int i = 0; i < np; i++) if (!strncmp(sh->key, pre[i], strlen(pre[i]))) hit = 1;
+    if (!hit) return;
+    left--;
+    char line[2000]; int o = snprintf(line, sizeof line, "[bind] f%llu st%d %.16s", (unsigned long long)atomic_load(&g_cur_frame), nvn_stage, sh->key);
+    for (int i = 0; i < sh->rf.nb && o < 1100; i++) { const nvn_rbind *b = &sh->rf.b[i];
+        if (b->kind == NVN_RB_SBUFP && b->reg < 16) { const p_bind_buf *u = &S.ssbo[nvn_stage][b->reg];
+            o += snprintf(line + o, sizeof line - o, " sbuf%d=%#llx+%#llx%s", b->reg, (unsigned long long)u->addr, (unsigned long long)u->size, b->rw ? "(rw)" : "");
+            void *mb; uint64_t mo; if (u->addr && u->size >= 8 && mtl_addr(u->addr, 8, &mb, &mo)) { const uint32_t *w = (const uint32_t *)((char *)((__bridge id<MTLBuffer>)mb).contents + mo); int nw = u->size >= 256 ? 64 : (int)(u->size / 4);
+                o += snprintf(line + o, sizeof line - o, "["); for (int k = 0; k < nw; k++) o += snprintf(line + o, sizeof line - o, k ? " %x" : "%x", w[k]); o += snprintf(line + o, sizeof line - o, "]"); }
+            continue; }
+        if (b->kind == NVN_RB_CBUF && b->reg < 16) { const p_bind_buf *u = &S.ubo[nvn_stage][b->reg]; void *mb; uint64_t mo;
+            o += snprintf(line + o, sizeof line - o, " c%d=%#llx+%#llx", b->reg, (unsigned long long)u->addr, (unsigned long long)u->size);
+            if (u->addr && u->size >= 48 && mtl_addr(u->addr, 48, &mb, &mo)) { const float *f = (const float *)((char *)((__bridge id<MTLBuffer>)mb).contents + mo);
+                o += snprintf(line + o, sizeof line - o, "[%g %g %g %g | %g %g %g %g | %g %g %g %g]", f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11]); }
+            continue; }
+        if (b->kind != NVN_RB_TEX && b->kind != NVN_RB_IMG && b->kind != NVN_RB_TBUF) continue;
+        uint64_t h = b->kind == NVN_RB_IMG ? (b->reg < 32 ? S.img[nvn_stage][b->reg] : 0) : (b->reg < 128 ? S.tex[nvn_stage][b->reg] : 0);
+        int tid = (int)(h & 0xfffff); void *tv = NULL; if (tid) (void)tex_fast_rid(tid, &tv);
+        o += snprintf(line + o, sizeof line - o, " %s%d=id%d/ser%llu/mem%p/%ux%u", b->kind == NVN_RB_IMG ? "img" : b->kind == NVN_RB_TBUF ? "tbuf" : "tex", b->reg, tid,
+                      tid && tid < g_ntreg ? (unsigned long long)g_treg[tid].t.serial : 0ull, tid && tid < g_ntreg ? (void *)g_treg[tid].t.mem : NULL,
+                      tid && tid < g_ntreg ? g_treg[tid].t.d.width : 0u, tid && tid < g_ntreg ? g_treg[tid].t.d.height : 0u);
+        if (tid && tid < g_ntreg) o += snprintf(line + o, sizeof line - o, "/target%u/flags%#x/fmt%#x/linear%d/stride%u", g_treg[tid].t.d.target, g_treg[tid].t.d.flags, g_treg[tid].t.d.format,
+                                                nvn_tex_is_linear(&g_treg[tid].t.d), nvn_tex_is_linear(&g_treg[tid].t.d) ? nvn_tex_linear_stride(&g_treg[tid].t.d) : 0u);
+        if (tid && tid < g_ntreg && g_treg[tid].t.mem && g_treg[tid].t.L.size >= 16) { float f[4]; memcpy(f, g_treg[tid].t.mem, 16); o += snprintf(line + o, sizeof line - o, "[%g %g %g %g]", f[0], f[1], f[2], f[3]); } }
+    if (nvn_stage == 1 && R.has_rt && R.rt.color[0]) o += snprintf(line + o, sizeof line - o, " rt0=ser%llu/mem%p/%ux%u", (unsigned long long)R.rt.color[0]->serial, (void *)R.rt.color[0]->mem, R.rt.color[0]->d.width, R.rt.color[0]->d.height);
+    MLOG("%s", line);
+}
 static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex) {
+    bind_trace(sh, nvn_stage);
     if(nvn_stage==1 && sh->hdr_fn && atomic_load(&g_hdr_frame_enabled)) {   /* the HDR twin's uniform, only with HDR on (PR #1129) */
         /* Immutable arena bytes survive queued rendering; never overwrite an in-flight mode. */
         id<MTLBuffer> b=nil;size_t off=arena_alloc(sizeof(TotkHDRUniform),&b);
@@ -10820,7 +10960,7 @@ static int state_op(uint32_t op, const void *a) {
         case OP_VIEWPORTS: { const p_viewports *b = a; for (int i = 0; i < b->n; i++) memcpy(S.vp[b->first + i], b->v[i], 16); S.has_vp = 1; break; }
         case OP_DEPTH_RANGE: { const p_depth_range *b = a; S.dr[0] = b->n; S.dr[1] = b->f; break; }
         case OP_BLEND_COLOR: memcpy(S.blend_color, ((const p_blend_color *)a)->rgba, 16); break;
-        case OP_COPY_STRIDE: S.copy_stride = ((const p_copy_stride *)a)->stride; break;
+        case OP_COPY_STRIDE: { const p_copy_stride *cs = a; if (cs->image) S.copy_image_stride = cs->stride; else S.copy_stride = cs->stride; break; }
         case OP_DEPTH_CLAMP: S.depth_clamp = ((const p_flag *)a)->value; break;
         case OP_RENDER_ENABLE: S.render_disabled = !((const p_flag *)a)->value; break;
         case OP_RENDER_COND: S.render_disabled = !cond_eval(a, (const uint8_t *)a - 8); PD("E cond addr=%#llx mode=%d -> %s", (unsigned long long)((const p_render_cond *)a)->addr, ((const p_render_cond *)a)->mode, S.render_disabled ? "disabled" : "enabled"); break;
@@ -11419,7 +11559,8 @@ static id<MTLFunction> att_fb_take(NvProg *pr, uint64_t *rs, int *n) {
         for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i]; uint64_t h;
             if (b->kind == NVN_RB_IMG) h = b->reg < 32 ? S.img[sh->stage][b->reg] : 0; else if (b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) h = b->reg < 128 ? S.tex[sh->stage][b->reg] : 0; else continue;
             if (h && has_ser(took, nt, h_ser(h))) return nil; } }
-    id<MTLFunction> fn = fs_fn_fbread(fs, aid, att, k);
+    BOOL hdr = fs->hdr_fn && atomic_load(&g_hdr_frame_enabled);
+    id<MTLFunction> fn = fs_fn_fbread(fs, aid, att, k, hdr);
     if (fn) { int o = 0; g_pso_fbrec[0] = 0; for (int i = 0; i < k && o < (int)sizeof g_pso_fbrec - 24; i++) o += snprintf(g_pso_fbrec + o, sizeof g_pso_fbrec - o, "%d:%d;", aid[i], att[i]); }
     if (!fn) return nil;
     int m = 0; for (int i = 0; i < *n; i++) if (!has_ser(took, nt, rs[i])) rs[m++] = rs[i];
@@ -14099,7 +14240,22 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
       if (nsk < 0) { nsk = 0; for (const char *q = getenv("DM_NVN_SKIP_FS"); q && *q && nsk < 16; q = strchr(q, ',') ? strchr(q, ',') + 1 : q + strlen(q)) { size_t n = strcspn(q, ","); if (n > 16) n = 16; memcpy(sk[nsk], q, n); sk[nsk++][n] = 0; }
                      if (nsk) MLOG("DM_NVN_SKIP_FS：丢弃 %d 个片元着色器的绘制（诊断，画面不对）", nsk); }
       if (g_ub_n > 0 && pr->sh[1] && !g_defer_replaying && ub_skip(pr->sh[1]->key)) return;   // 同进程交替测量：本相丢这一类 | In-process alternating measurement: this phase drops this class
-      if (nsk && pr->sh[1] && !g_defer_replaying) for (int i = 0; i < nsk; i++) if (!strncmp(pr->sh[1]->key, sk[i], strlen(sk[i]))) return; }
+      if (nsk && pr->sh[1] && !g_defer_replaying) for (int i = 0; i < nsk; i++) if (!strncmp(pr->sh[1]->key, sk[i], strlen(sk[i]))) {
+          /* TOTK_FS_UBO_DUMP=<folder> (diagnostic, with DM_NVN_SKIP_FS): the uniform buffers a skipped draw's fragment shader
+             would have read, as the CPU sees them at the draw, the first 4 draws of each shader: <folder>/<key>_<n>_c<slot>.bin.
+             Finds a shader that loops on a uniform value without letting it hang the GPU (Pokemon Pokopia, 2026-11-03). */
+          static const char *dump; static int dread; static NSMutableDictionary<NSString *, NSNumber *> *dn;
+          if (!dread) { dread = 1; dump = getenv("TOTK_FS_UBO_DUMP"); if (dump) dn = [NSMutableDictionary dictionary]; }
+          NvShader *fs = pr->sh[1]; NSString *fk = [@(fs->key) substringToIndex:MIN((NSUInteger)16, strlen(fs->key))]; int n = [dn[fk] intValue];
+          if (dump && n < 4) { dn[fk] = @(n + 1);
+              for (int b = 0; b < fs->rf.nb; b++) { const nvn_rbind *rb = &fs->rf.b[b]; if (rb->kind != NVN_RB_CBUF || rb->reg >= 16) continue;
+                  const p_bind_buf *u = &S.ubo[1][rb->reg]; void *mb; uint64_t mo; size_t len = (size_t)MIN(u->size, (uint64_t)65536);
+                  int ok = u->addr && len && mtl_addr(u->addr, len, &mb, &mo);
+                  MLOG("[fs-ubo] %s draw %d slot %d addr %#llx size %#llx%s", fk.UTF8String, n, rb->reg, (unsigned long long)u->addr, (unsigned long long)u->size, ok ? "" : " (not in a pool: not dumped)");
+                  if (!ok) continue;
+                  char path[1024]; snprintf(path, sizeof path, "%s/%s_%d_c%d.bin", dump, fk.UTF8String, n, rb->reg);
+                  FILE *f = fopen(path, "wb"); if (f) { fwrite((const void *)(uintptr_t)u->addr, 1, len, f); fclose(f); } else MLOG("[RED] TOTK_FS_UBO_DUMP: cannot write %s", path); } }
+          return; } }
     // 同类诊断 DM_NVN_SKIP_SMALL=<宽>：丢掉目标宽度（按所挂的级）≤ 该值的全部绘制——量「极小通道整批丢掉」在并行流水下值多少（每通道固定开销）
     // Similar diagnostic DM_NVN_SKIP_SMALL=<width>: drop all draws whose target width (by the attached level) is <= this value -- measures how much "dropping tiny render passes in bulk" is worth under the parallel pipeline (fixed per-pass overhead)
     { static int small = -1; if (small < 0) { const char *e = getenv("DM_NVN_SKIP_SMALL"); small = e ? atoi(e) : 0; if (small) MLOG("DM_NVN_SKIP_SMALL：丢弃目标宽度 ≤ %d 的绘制（诊断，画面不对）", small); }
@@ -14164,6 +14320,8 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (S.color.logic_op != NVN_LOGIC_OP_COPY || (S.color.alpha_func && S.color.alpha_func != NVN_ALPHA_FUNC_ALWAYS))
         RED_ONCE(70, "TOTK: logic op %u / alpha test %u not implemented on Metal (drawn without it)", S.color.logic_op, S.color.alpha_func);
     if (S.render_disabled || S.raster_discard) { g_draw_skip[S.render_disabled ? 3 : 4]++; return; }   // TOTK: SetRenderEnable(false) / SetRasterizerDiscard(true)
+    if (R.has_rt && R.rt.n > 0 && R.rt.color[0]) { extern uint32_t g_rt_draws[64]; extern uint64_t g_rt_draw_ser[64]; unsigned k = (unsigned)(R.rt.color[0]->serial & 63);
+        if (g_rt_draw_ser[k] != R.rt.color[0]->serial) { g_rt_draw_ser[k] = R.rt.color[0]->serial; g_rt_draws[k] = 0; } g_rt_draws[k]++; }   // the shot log's draw count
     if (S.poly.cull == NVN_FACE_FRONT_AND_BACK) { g_draw_skip[5]++; return; }
     if (exp_skip_fs(pr)) return;   // TOTK_EXP_SKIP_FS (measurement only)
     // 续用的通道可能是少挂深度 / 模板开的（开法 2 / 3 / 4）：这次绘制要的平面没挂，就在它之前切开（重开时按新前瞻挂）
@@ -14536,7 +14694,14 @@ frz_plain:;
     if (!att_n) for (int i = 0; i < g_nsd; i++) if (g_sd[i].wrote) g_sd_plain |= 1u << i;   // att_unstored_read: draws of a sampling run do not count
     // 0 个图元的绘制（游戏会发 count=0）不画任何像素，跳过编码；Metal 规定计数必须非零，校验层否则当场中止（营地 / 野外 / 战斗页实测）
     // A draw with 0 primitives (the game does send count=0) draws no pixels, so skip encoding; Metal requires the count to be non-zero, otherwise the validation layer aborts on the spot (measured on the camp / wilderness / combat pages)
-    if (dw && prim == NVN_DRAW_PRIMITIVE_QUAD_STRIP) {
+    if (dw && dw->ind) {   /* nvnCommandBufferDrawArraysIndirect: the GPU reads the count and the rest from the record (hle_nvn.c) */
+        void *ib; uint64_t io, igpu;
+        if (!mtl_gpu_addr(dw->ind, 16, &ib, &io, &igpu)) { RED_ONCE(175, "indirect draw record outside its memory pool"); return; }
+        if (prim == NVN_DRAW_PRIMITIVE_QUADS || prim == NVN_DRAW_PRIMITIVE_QUAD_STRIP || prim == NVN_DRAW_PRIMITIVE_POLYGON) { RED_ONCE(176, "non-indexed indirect draw of quads or polygons: no conversion, skipped"); return; }
+        use_rec("buf", dw->ind, 16, 0, NULL);
+        enc_r_draw_indirect(en, mp, igpu);
+        static int once; if (!once++) MLOG("NVN indirect draw: the GPU reads its record (first at %#llx)", (unsigned long long)dw->ind);
+    } else if (dw && prim == NVN_DRAW_PRIMITIVE_QUAD_STRIP) {
         /* Hero's Path uses quad strips for its route. Pair boundaries and winding must survive the conversion;
            incomplete final pairs draw nothing. Batch long strips over one shared index buffer, preserving vertex IDs. */
         enum { QUAD_STRIP_BATCH = 65536 };
@@ -14854,6 +15019,9 @@ static void dispatch(const p_dispatch *dp) {
 // GPU：贴图 → 缓冲（行距取 SetCopyRowStride，0 = 紧排）
 // GPU: texture -> buffer (row stride taken from SetCopyRowStride, 0 = tightly packed)
 static void copy_t2b(const p_copy_b2t *c) {
+    { static long on = -1; static int left = 24; if (on < 0) { const char *e = getenv("TOTK_T2T_LOG"); on = e ? atol(e) : 0; if (e && !on) on = 1; }   // with TOTK_T2T_LOG: buffer <-> texture copies too
+      if (on > 0 && (long)atomic_load(&g_cur_frame) >= on && left > 0 && c->tex) { left--;
+          MLOG("[%s] f%llu tex ser=%llu %ux%u fmt=%#x mem=%p buf=%#llx", "t2b", (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)c->tex->serial, c->tex->d.width, c->tex->d.height, c->tex->d.format, (void *)c->tex->mem, (unsigned long long)c->src); } }
     if (c->tex) xv_check(c->tex->serial, c->has_view && c->view.set_levels ? c->view.base_level : 0, c->has_view && c->view.set_layers ? c->view.min_layer : 0, "贴图读缓冲");
     if (atomic_load(&g_draw_log) > 0 && c->tex)
         MLOG("[uw] F%llu pass %llu copy t2b ser %llu %ux%u fmt %#x region %d,%d %dx%d -> %#llx", (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass, (unsigned long long)c->tex->serial,
@@ -14863,7 +15031,7 @@ static void copy_t2b(const p_copy_b2t *c) {
     int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);
     unsigned level = c->has_view && c->view.set_levels ? c->view.base_level : 0, layer0 = c->has_view && c->view.set_layers ? c->view.min_layer : 0;
     size_t row = S.copy_stride ? (size_t)S.copy_stride : (size_t)((c->r.width + bw - 1) / bw) * bpb;
-    size_t rows = (c->r.height + bh - 1) / bh, img = row * rows;
+    size_t rows = (c->r.height + bh - 1) / bh, img = S.copy_image_stride ? (size_t)S.copy_image_stride : row * rows;   // SetCopyImageStride, else packed
     int is3d = c->tex->d.target == 2, nz = c->r.depth ? c->r.depth : 1;
     void *mb; uint64_t mo;
     upd_guard(c->src, c->src + img * nz);   // TOTK: renamed uniform updates before a GPU write to the range
@@ -15056,6 +15224,9 @@ void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVN
     if (!nogpu() && cb.status != MTLCommandBufferStatusCompleted) die("WriteTexels: GPU upload failed");
 }
 static void copy_b2t(const p_copy_b2t *c) {
+    { static long on = -1; static int left = 24; if (on < 0) { const char *e = getenv("TOTK_T2T_LOG"); on = e ? atol(e) : 0; if (e && !on) on = 1; }   // with TOTK_T2T_LOG: buffer <-> texture copies too
+      if (on > 0 && (long)atomic_load(&g_cur_frame) >= on && left > 0 && c->tex) { left--;
+          MLOG("[%s] f%llu tex ser=%llu %ux%u fmt=%#x mem=%p buf=%#llx", "b2t", (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)c->tex->serial, c->tex->d.width, c->tex->d.height, c->tex->d.format, (void *)c->tex->mem, (unsigned long long)c->src); } }
     if (c->tex) zskip_del(c->tex->serial);
     id<MTLTexture> t = tex_mtl(c->tex);
     PD("C ser=%llu", c->tex->serial);
@@ -15063,7 +15234,7 @@ static void copy_b2t(const p_copy_b2t *c) {
     int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);
     unsigned level = c->has_view && c->view.set_levels ? c->view.base_level : 0, layer0 = c->has_view && c->view.set_layers ? c->view.min_layer : 0;
     size_t row = S.copy_stride ? (size_t)S.copy_stride : (size_t)((c->r.width + bw - 1) / bw) * bpb;
-    size_t rows = (c->r.height + bh - 1) / bh, img = row * rows;
+    size_t rows = (c->r.height + bh - 1) / bh, img = S.copy_image_stride ? (size_t)S.copy_image_stride : row * rows;   // SetCopyImageStride, else packed
     int is3d = c->tex->d.target == 2, nz = c->r.depth ? c->r.depth : 1;
     void *mb; uint64_t mo;
     upd_guard(c->src, c->src + img * nz);   // TOTK: renamed uniform updates before a GPU read of the range
@@ -15136,6 +15307,12 @@ static int copy_t2t_astc(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsign
 // GPU：贴图 → 贴图（原先误列为空操作，选角页每帧 3 次）。等尺寸、不镜像、同格式 → 逐层 blit；其余语义（缩放带过滤、镜像、换格式）blit 表达不了，报红待实现
 // GPU: texture -> texture (previously mislisted as a no-op, 3 times per frame on the character select page). Same size, not mirrored, same format -> blit layer by layer; the other semantics (scaling with filtering, mirroring, format change) cannot be expressed by blit: report a failure, to be implemented
 static void copy_t2t(const p_copy_t2t *c) {
+    { static long on = -1; static int left = 24; if (on < 0) { const char *e = getenv("TOTK_T2T_LOG"); on = e ? atol(e) : 0; if (e && !on) on = 1; }   // TOTK_T2T_LOG=<from frame> (diagnostic): 24 texture copies from that frame, their ends
+      if (on > 0 && (long)atomic_load(&g_cur_frame) >= on && left > 0 && c->src && c->dst) { left--;
+          MLOG("[t2t] f%llu src ser=%llu %ux%u fmt=%#x mem=%p -> dst ser=%llu %ux%u fmt=%#x mem=%p region %d,%d %dx%d -> %d,%d %dx%d flags %#x",
+               (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)c->src->serial, c->src->d.width, c->src->d.height, c->src->d.format, (void *)c->src->mem,
+               (unsigned long long)c->dst->serial, c->dst->d.width, c->dst->d.height, c->dst->d.format, (void *)c->dst->mem,
+               c->sr.xoffset, c->sr.yoffset, c->sr.width, c->sr.height, c->dr.xoffset, c->dr.yoffset, c->dr.width, c->dr.height, c->flags); } }
     if (c->src) xv_check(c->src->serial, c->has_sv && c->sv.set_levels ? c->sv.base_level : 0, c->has_sv && c->sv.set_layers ? c->sv.min_layer : 0, "贴图拷贝源");
     rp_flush();   // 挂起的纯清除通道先落地（零源候选在通道结束时才进集合）；下面 blit() 本来也会结束通道 | Land the pending pure-clear render pass first (zero-source candidates only enter the set when the render pass ends); the blit() below would end the render pass anyway
     if (c->dst) zskip_del(c->dst->serial);
@@ -15149,6 +15326,10 @@ static void copy_t2t(const p_copy_t2t *c) {
     PD("T src=%llu dst=%llu %dx%dx%d→%dx%dx%d flags=%#x", c->src->serial, c->dst->serial, c->sr.width, c->sr.height, c->sr.depth, c->dr.width, c->dr.height, c->dr.depth, c->flags);
     if (!s || !d) return;
     unsigned sl = c->has_sv && c->sv.set_levels ? c->sv.base_level : 0, dl = c->has_dv && c->dv.set_levels ? c->dv.base_level : 0;
+    { static int on = -1, left = 24; if (on < 0) on = getenv("TOTK_T2T_LOG") != NULL;
+      if (on && left > 0) { left--; MLOG("[t2t-storage] src ser=%llu guest=%ux%u/%u mips Metal=%lux%lu/%lu mips level=%u -> dst ser=%llu guest=%ux%u/%u mips Metal=%lux%lu/%lu mips level=%u",
+          (unsigned long long)c->src->serial,c->src->d.width,c->src->d.height,c->src->d.levels,(unsigned long)s.width,(unsigned long)s.height,(unsigned long)s.mipmapLevelCount,sl,
+          (unsigned long long)c->dst->serial,c->dst->d.width,c->dst->d.height,c->dst->d.levels,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.mipmapLevelCount,dl); } }
     unsigned sz0 = c->has_sv && c->sv.set_layers ? c->sv.min_layer : 0, dz0 = c->has_dv && c->dv.set_layers ? c->dv.min_layer : 0;
     PD("t src=%llu lv%u sl%u xyz=%d,%d,%d dst=%llu lv%u sl%u xyz=%d,%d,%d size=%d,%d,%d", c->src->serial, sl, sz0, c->sr.xoffset, c->sr.yoffset, c->sr.zoffset,
        c->dst->serial, dl, dz0, c->dr.xoffset, c->dr.yoffset, c->dr.zoffset, c->sr.width, c->sr.height, c->sr.depth);
@@ -15561,7 +15742,9 @@ void mtl_exec(const uint8_t *p) {
             case OP_COPY_T2T: copy_t2t(a); break;
             case OP_CLEAR_TEX: clear_tex(a); break;
             case OP_DISPATCH: dispatch(a); break;
-            case OP_BARRIER: case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: break;
+            case OP_SET_TEX_POOL: { const dpool_t *tp = ((const p_set_pool *)a)->pool; extern int nvn_tex_pool_base(const void *pool);   // hle_nvn.c: IDs past this pool's part of the table read 0
+                                    S.tex_pool_n = tp ? nvn_tex_pool_base(tp) + tp->n : 0; break; }
+            case OP_BARRIER: case OP_SET_SAMP_POOL: break;
             default: break;
         }
         p += h.size;
@@ -15692,6 +15875,7 @@ void dm_gfx_shot_at(long k, const char *path) {
 /* TOTK: frame-keyed screenshots taken at the game's present call (nvnQueuePresentTexture), independent of the display
    link / drawable pacing (an asleep or locked display stalls presents; the game keeps running). DM_NVN_SHOT_FRAME=1 with
    DM_NVN_SHOT=frame,...:path. */
+uint32_t g_rt_draws[64]; uint64_t g_rt_draw_ser[64];   // draws into a colour target 0 since its last present (by serial; the [shot] line)
 void mtl_shot_at_present(const tex_t *t) {
     static long shots[16]; static int nshot = -1; static const char *shot_path; static char done[16]; static int by_frame;
     if (nshot < 0) {
@@ -15702,10 +15886,12 @@ void mtl_shot_at_present(const tex_t *t) {
     pthread_mutex_lock(&g_shotq_mu);   // dm_gfx_shot_at requests (game-frame keyed, see there)
     for (int i = 0; i < g_nshotq;) if ((uint64_t)cur >= g_shotq[i].frame) {
         id<MTLTexture> src = tex_mtl(t);
-        if (src) { mtl_finish_gpu(); shot(src, g_shotq[i].path, 1, NULL); MLOG("[shot] F%ld %s", cur, g_shotq[i].path); } else MLOG("【红】截图：出图纹理不可用，丢弃 %s", g_shotq[i].path);
+        if (src) { mtl_finish_gpu(); shot(src, g_shotq[i].path, 1, NULL); unsigned k = (unsigned)(t->serial & 63);
+            MLOG("[shot] F%ld %s ser=%llu draws since its last present %u", cur, g_shotq[i].path, (unsigned long long)t->serial, g_rt_draw_ser[k] == t->serial ? g_rt_draws[k] : 0u); } else MLOG("【红】截图：出图纹理不可用，丢弃 %s", g_shotq[i].path);
         g_shotq[i] = g_shotq[--g_nshotq];
     } else i++;
     BOTW_ASHOT_POLL(t, cur) pthread_mutex_unlock(&g_shotq_mu);
+    { unsigned k = (unsigned)(t->serial & 63); if (g_rt_draw_ser[k] == t->serial) g_rt_draws[k] = 0; }   // counted again until its next present
     if (!nshot) return;
     for (int i = 0; i < nshot; i++) if (!done[i] && cur >= shots[i]) {
         done[i] = 1; id<MTLTexture> src = tex_mtl(t); if (!src) { MLOG("【红】截图：出图纹理不可用"); continue; }
@@ -16321,7 +16507,9 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp]; es_reset();
     [en setViewport:vp];
-    [en setRenderPipelineState:g_blit_hdr_pso && (src.pixelFormat==MTLPixelFormatRGBA16Float || dst.pixelFormat==MTLPixelFormatRGBA16Float) ? g_blit_hdr_pso : g_blit_pso];   // an FP16 picture or drawable: the HDR copy (it decodes SDR input) [en setFragmentTexture:src atIndex:0]; [en setFragmentSamplerState:g_blit_samp atIndex:0];
+    [en setRenderPipelineState:g_blit_hdr_pso && (src.pixelFormat==MTLPixelFormatRGBA16Float || dst.pixelFormat==MTLPixelFormatRGBA16Float) ? g_blit_hdr_pso : g_blit_pso];   // an FP16 picture or drawable: the HDR copy
+    [en setFragmentTexture:src atIndex:0];
+    [en setFragmentSamplerState:g_blit_samp atIndex:0];
     float uv[12] = {(float)cx / src.width, (float)cy / src.height, (float)cw / src.width, (float)ch / src.height,
                    (cx + 0.5f) / src.width, (cy + 0.5f) / src.height, (cx + cw - 0.5f) / src.width, (cy + ch - 0.5f) / src.height};
     uv[8]=1;uv[9]=1;
@@ -19623,24 +19811,28 @@ int botw_wb_newer(const void *mem, uint64_t gen) {
    formats x 8 write masks) are built on 4 threads and added like the warm-up adds them (par_add, each thread its own
    batch, par_flush_thread), one key twice from two threads; then the folder is read back as a later start reads it,
    with files a cut-short write leaves, and every pipeline must come from its file without compiling
-   (MTLPipelineOptionFailOnBinaryArchiveMiss). The build folders the batches made must be gone. A forced late startup
-   cleanup while two batches overlap must keep their live folder; only the last batch may remove it. */
+   (MTLPipelineOptionFailOnBinaryArchiveMiss). The build folders the batches made must be gone from this binary's own
+   cache folder (its bundle id, runtime/game_info.plist), none made in the shared one. A forced late startup cleanup while
+   two batches overlap must keep their live folder; only the last batch may remove it, and never a shared folder made
+   meanwhile. Two processes: tests/test_pipeline_archive_folders.py. */
 static int par_probe_startup_cleanup(NSString *dir) {
     NSFileManager *fm = NSFileManager.defaultManager;
     NSString *owned = [dir stringByAppendingPathComponent:@"probe-owned"], *shared = [dir stringByAppendingPathComponent:@"probe-shared"];
     NSString *stale = [owned stringByAppendingPathComponent:@"gpuarchiver-stale"], *other = [shared stringByAppendingPathComponent:@"gpuarchiver-shared"];
     NSString *unrelated = [owned stringByAppendingPathComponent:@"keep-this-entry"], *live = [owned stringByAppendingPathComponent:@"gpuarchiver-live"];
+    NSString *during = [shared stringByAppendingPathComponent:@"gpuarchiver-during"];   // another program's, made while a batch is open
     for (NSString *path in @[stale, other, unrelated]) [fm createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:nil];
     g_par_probe_ga_dirs = @[@{@"path": owned, @"own": @YES}, @{@"path": shared, @"own": @NO}];
     par_open_dir(g_dev);
     if ([fm fileExistsAtPath:stale] || ![fm fileExistsAtPath:other] || ![fm fileExistsAtPath:unrelated])
         MDIE("pipeline archive probe: startup cleanup did not finish or removed unrelated/shared entries");
-    par_batch_begin();
-    [fm createDirectoryAtPath:live withIntermediateDirectories:YES attributes:nil error:nil];
+    if (!par_batch_begin()) MDIE("pipeline archive probe: no batch began (shared lock refused)");
+    for (NSString *path in @[live, during]) [fm createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:nil];
     dispatch_semaphore_t entered = dispatch_semaphore_create(0), leave = dispatch_semaphore_create(0);
     dispatch_group_t workers = dispatch_group_create();
     dispatch_group_async(workers, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        par_batch_begin(); dispatch_semaphore_signal(entered);
+        if (!par_batch_begin()) MDIE("pipeline archive probe: no overlapping batch began");
+        dispatch_semaphore_signal(entered);
         if (dispatch_semaphore_wait(leave, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC))) MDIE("pipeline archive probe: batch release timed out");
         par_batch_end();
     });
@@ -19652,10 +19844,10 @@ static int par_probe_startup_cleanup(NSString *dir) {
     if (![fm fileExistsAtPath:live]) MDIE("pipeline archive probe: first batch removed another batch's live folder");
     dispatch_semaphore_signal(leave);
     if (dispatch_group_wait(workers, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC))) MDIE("pipeline archive probe: final batch did not finish");
-    if ([fm fileExistsAtPath:live] || ![fm fileExistsAtPath:other] || ![fm fileExistsAtPath:unrelated])
+    if ([fm fileExistsAtPath:live] || ![fm fileExistsAtPath:other] || ![fm fileExistsAtPath:unrelated] || ![fm fileExistsAtPath:during])
         MDIE("pipeline archive probe: final batch cleanup left its folder or removed unrelated/shared entries");
     g_par_probe_ga_dirs = nil;   // all fixture workers joined; real Metal batches use the normal cache folders
-    return 6;
+    return 7;
 }
 int mtl_probe_pipeline_archive(void) {
     NSString *dir = [NSTemporaryDirectory() stringByAppendingFormat:@"totk-probe-pipeline-archive-%d", getpid()];
@@ -19681,7 +19873,9 @@ int mtl_probe_pipeline_archive(void) {
         d.colorAttachments[0].pixelFormat = fmts[i % 12]; d.colorAttachments[0].writeMask = (MTLColorWriteMask)(15 - i / 12);
         [descs addObject:d]; char k[32]; snprintf(k, sizeof k, "probe-%d", i); [keys addObject:par_hash(k, strlen(k))];
     }
-    NSSet<NSString *> *folders_before = par_ga_list(0);
+    int own_dirs = 0; for (NSDictionary *d in par_ga_dirs()) own_dirs += [d[@"own"] boolValue];
+    if (!own_dirs) MDIE("pipeline archive probe: no bundle id, so no cache folder of its own (runtime/game_info.plist not linked?)");
+    NSSet<NSString *> *folders_before = par_ga_list(0); uint64_t removed_before = atomic_load(&g_par_ga_removed);
     __block _Atomic int built = 0;
     dispatch_apply(4, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t w) {
         int owip = par_write_in_place; par_write_in_place = 1;
@@ -19698,6 +19892,7 @@ int mtl_probe_pipeline_archive(void) {
     if (g_par_pending.count) MDIE("pipeline archive probe: %lu keys still pending", (unsigned long)g_par_pending.count);
     NSMutableSet *left = [par_ga_list(0) mutableCopy]; [left minusSet:folders_before];
     if (left.count) MDIE("pipeline archive probe: %lu build folders left (%s)", (unsigned long)left.count, [left.anyObject UTF8String]);
+    if (atomic_load(&g_par_ga_removed) == removed_before) MDIE("pipeline archive probe: Metal made no build folder in this binary's own cache folder");
     NSArray<NSString *> *names = [NSFileManager.defaultManager contentsOfDirectoryAtPath:par_dir() error:nil];
     NSUInteger archives = 0, lists = 0, listed = 0;
     for (NSString *name in names) {
@@ -19778,13 +19973,37 @@ int mtl_probe_pipeline_archive(void) {
    draw), exactly as a draw's prog_get would ask, so the keys and variant names are the runtime's own; the translations
    land in the translation cache (TOTK_SHADER_CACHE) and the boot prewarm builds their Metal libraries. A shader already
    there is not translated again. Corpus: "NS2SHC01", u32 count, then per shader u32 stage, u32 control length, u32 code
-   length, u16 label length, the label, the control section, the code area. */
-void runtime_shader_seed(const char *path) { @autoreleasepool {
+   length, u16 label length, the label, the control section, the code area.
+   With the game's shared shader list (a second argument, games/<game>/assets/shader_list.tsv), every bind state its V
+   rows name for a shader of the corpus is translated too, with the answers a build gives that row (totk_contrib_answers),
+   so the variant carries the name the list's warm rows use (totk_contrib_listed_name), as prepare_shader_seed.py does for
+   Tears of the Kingdom: the packaged app's pipeline archive (build_app.py mac_pipelines) builds those pipelines. */
+void runtime_shader_seed(const char *path, const char *list) { @autoreleasepool {
+    /* Offline translation does not run the game's device setup. The build passes the mode observed in that setup;
+       NVN's default alone is insufficient for games that explicitly select near=0 (Pokopia). */
+    offline_depth_mode(getenv("TOTK_SEED_DEPTH_MODE"));
     NSData *d = [NSData dataWithContentsOfFile:@(path)];
     if (!d || d.length < 12 || memcmp(d.bytes, "NS2SHC01", 8)) MDIE("seed-shaders: %s is not a shader corpus (scripts/ns2_shader_corpus.py)", path);
     const uint8_t *p = (const uint8_t *)d.bytes + 12, *end = (const uint8_t *)d.bytes + d.length;
     uint32_t n; memcpy(&n, (const uint8_t *)d.bytes + 8, 4);
     NSDictionary *answers = @{@"tex": @{}, @"img": @{}, @"attr": @{}, @"fout": @{}};
+    NSMutableDictionary<NSString *, NSMutableArray<NSDictionary *> *> *listed = [NSMutableDictionary dictionary];   // shader key -> the list's bind states for it
+    if (list) {
+        NSString *text = [NSString stringWithContentsOfFile:@(list) encoding:NSUTF8StringEncoding error:nil];
+        if (!text) MDIE("seed-shaders: cannot read the shader list %s", list);
+        for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
+            NSArray<NSString *> *f = [line componentsSeparatedByString:@"\t"];
+            if (f.count != 3 || ![f[0] isEqualToString:@"V"] || f[1].length != 64) continue;
+            NSDictionary *deps = [NSJSONSerialization JSONObjectWithData:[f[2] dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+            if (![deps isKindOfClass:NSDictionary.class]) continue;
+            NSDictionary *a = totk_contrib_answers(deps);
+            if ([a isEqual:answers]) continue;   // the default bind state: translated for every shader anyway
+            if (!listed[f[1]]) listed[f[1]] = [NSMutableArray array];
+            [listed[f[1]] addObject:a];
+        }
+    }
+    unsigned listed_n = 0;
+    NSMutableArray<NSArray *> *listed_jobs = [NSMutableArray array];   // (key, answers) to check once the queue is empty
     totk_rt_fail_soft();   // a shader the translator cannot do yet is counted below, not the end of the seed
     NSMutableArray<NSString *> *keys = [NSMutableArray array];
     unsigned other_stage = 0, bad = 0; uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
@@ -19799,6 +20018,7 @@ void runtime_shader_seed(const char *path) { @autoreleasepool {
         char key[65]; shader_key_of(ctl, code, kn, key);
         totk_rt_variant(@(key), stage, ctl, code, answers, rt_local(ctl, stage), 1);
         [keys addObject:@(key)];
+        for (NSDictionary *a in listed[@(key)]) { totk_rt_variant(@(key), stage, ctl, code, a, rt_local(ctl, stage), 1); [listed_jobs addObject:@[@(key), a]]; listed_n++; }
     }
     MLOG("[seed] %u shaders in %s: %lu queued for translation (already translated ones answer at once), %u of other stages left out (no translation chain), %u unreadable",
          n, path, (unsigned long)keys.count, other_stage, bad);
@@ -19811,4 +20031,6 @@ void runtime_shader_seed(const char *path) { @autoreleasepool {
     MLOG("[seed] done in %.0f s: %u of %lu shaders have a translation for the default bind state in %s%s%s", (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e9,
          ok, (unsigned long)keys.count, totk_rt_dir().UTF8String, missing.count ? "; without one (translation failed, see above): " : "", [missing componentsJoinedByString:@" "].UTF8String);
     if (ok != keys.count) MLOG("[seed] [RED] %lu shaders could not be translated: their draws translate them again in the game (and fail the same way)", (unsigned long)(keys.count - ok));
+    if (list) { unsigned lok = 0; for (NSArray *j in listed_jobs) if (totk_rt_variant_cached(j[0], j[1])) lok++;
+        MLOG("[seed] the shader list's bind states: %u of %u translated (%lu shaders of the list are in the corpus)", lok, listed_n, (unsigned long)listed.count); }
 }}

@@ -1,5 +1,10 @@
 # Switch 2 (NS2) in the Tears of the Kingdom runtime
 
+NS2 dumps containing only ExeFS/RomFS have no Control-NCA icon. A game's `assets/app-icon.json` can identify its official
+image by URL and SHA-256; preparation caches the verified image and generates `build/AppIcon.icns` outside the source
+tree. Both the Mac app and the iOS asset catalog use that icon. Check the packaged `CFBundleIcons`, `Assets.car`, and
+the installed phone's SpringBoard icon image; a successful build alone does not prove that a home-screen icon exists.
+
 Branch `ns2` (started 2026-11-02). Goal: Switch 2 games run on the same runtime as Tears of the Kingdom and Breath of the
 Wild (`games/totk/runtime`, `third_party/d2r_gfx`, the `totk_xlate` translator), not as a separate copy of another
 project. First target: **Donkey Kong Bananza** (title `040074A01BF12000`, update v458752, SDK 20.5.19, NVN2) on the Mac,
@@ -81,7 +86,7 @@ How it is built and run (outside the repository; game files stay with the dump):
   `prepare_modules.py`, the rewriter (`DM_RULESET=native DM_PRIVATE_GATES=0 patch_nso.py` for `sdk` and `main`),
   `verify_rewrites.py --version dkb` (all gates pass), `make game-data-dkb runtime-dkb SHADER_LIST=../dkb/assets/shader_list.tsv`.
 - `build/totk-native-dkb rewritten/dkb boot` with the launcher's GPU settings (`TOTK_GPU_ALLOW_SUBMIT=1 TOTK_GPU_WIDEN=1
-  TOTK_GPU_BLOCKRT=1 TOTK_GPU_MIDCLEAR=1`). build_app.py does not know the game yet.
+  TOTK_GPU_BLOCKRT=1 TOTK_GPU_MIDCLEAR=1`). build_app.py does not know the game yet (Pokopia it does since 2026-11-04).
 
 Found on the way (general fixes, each in the code with its reason):
 - a mip-chain pass sampled the level it renders (Metal fetches it at weight 0; undefined data, 0 x NaN): the environment
@@ -150,6 +155,148 @@ Added for it (general where possible, each with its reason in the code):
 - Open: at the first full scene (frame ~640: 95 draws, 20 dispatches) the GPU hangs (kIOGPUCommandBufferCallbackErrorHang)
   and macOS ignores the process's later submissions (black). Not an indirect draw; the FFT and 70ab27e1 compute shaders
   are bounded. Diagnostics added: TOTK_SKIP_CS=all|<prefixes>, TOTK_SKIP_CS_LOG=1, TOTK_CS_UBO_LOG=<prefix>.
+
+**Pokopia, evening 2026-11-03: the GPU hang is fixed; the game reaches its language selection.**
+- Cause: a translator bug. A two-source half-pair operation (HADD2, HMUL2, HSET2, HSETP2, HMNMX2) in forms 2, 3 and 7 takes
+  its second source from the 32-bit slot (here an immediate); patch 0006 took the unused register field at 64 instead (R0).
+  Fragment shader 85446a67 (a bilateral blur) steps its loop with `HADD2 R6, R6, 2.0, 2.0`: the step became the bits of
+  whatever R0 held, the loop never ended, the GPU hung, and macOS reset the GPU for every app (other apps' renderers failed
+  too). Fixed as seedds/nxnative 03d92a9f (MIT) does: `AHalfSecond`, and an immediate's bits 62 / 63 are not modifiers.
+  It changed 260 of Pokopia's 2,384 translations; Bananza's are Ampere too (its cache needs translating again).
+- Found without hanging the GPU again: `DM_NVN_SKIP_FS=<prefixes>` (up to 16) halves the fragment shaders whose draws are
+  skipped; `TOTK_FS_UBO_DUMP=<folder>` (new) writes the uniform buffers a skipped draw would have read. A hang test that
+  hangs resets the whole GPU: run such bisections only with the user's agreement.
+- Also: a compute pipeline whose kernel does not take its declared thread group is built again for it (nvn_mtl.m cs_new;
+  none of Pokopia's needed it).
+- Open: Pokopia's offline corpus misses some shaders the game draws. 85446a67 was translated at run time, and no 32-byte window
+  of its instructions (but the common tail) is in the modules, LINKDATA or any IDRK entry, decompressed: it is not stored
+  as it is drawn (made or changed at load, or in a container not read yet).
+
+**Pokopia, night 2026-11-03: the language screen flickers black (about 10 frames in 12); fixed (see the next entry).**
+- The chain behind it is the auto-exposure: compute 8699f064 clears a 64-bin histogram (storage buffer, 0x100 bytes),
+  2118ab53 counts the scene's (texture ser 8190, read over 1728x972) log-luminance into it (threadgroup bins, then one
+  global atomic add per bin: MATCH.ALL fails, so every lane adds its own bin), d0c17f1f reads the histogram back as a
+  BUFFER texture (64x1, format 0xb, the same memory) and writes a 2x1 image, b2d97f59 copies it into 2x1 ser 5510, and
+  2c74cdd9 writes 8 bytes the CPU reads. Uniforms of 2118ab53 c2[2] = (1/32, 0.5, 1728, 972): bins cover 2^-16..2^16.
+- Fixed on the way (translator, Program.cs TexSlot): combined texture handles (nvnCommandBufferBindTexture, c[2] + 0x20,
+  32 slots with the separate table's numbers) had no slot, so the runtime's per-slot target answer was never read and a
+  fetch through one was typed as the instruction says. d0c17f1f's histogram fetch became a texture1d read of a texture
+  buffer (undefined on Metal); now it is a texture_buffer read. 154 of Pokopia's run-cache variants named a combined
+  handle without a type (moved to run2/cache-pre-combined and translated again). It did not end the flicker (1 of 12).
+  Not yet compared over a Tears of the Kingdom cache: only fetches that ask the slot's type change (TLD / TLDS buffer
+  test, TXQ, bindless), on combined handles.
+- Measured with the bind trace (below): the histogram buffer reads all zero on the CPU in every frame from 3900 on, and
+  2c74cdd9's result is [0, 1e6] (float 0 and 1,000,000). So 2118ab53 counts nothing: no texel of ser 8190 has a luminance
+  above 0 in the clamp's window (or the reads miss). Next: dump ser 8190 and check its content and its writer (texdump of
+  frame 4011 is in ns2-work/totk/run2/td_a), then why its luminance is 0 (pre-exposure from the previous exposure would
+  close a loop: exposure 0 -> black scene -> empty histogram).
+- Ruled out (A/B, 12 screenshots a second apart): present timing, TOTK_GPU_BLOCKRT, writeback, render stream, async
+  replay, CPU deswizzle, window texture uploads, sync lag; ResourceAlias visibility on the barriers between dispatches
+  (2 of 12).
+- Diagnostics (default off): TOTK_BIND_TRACE=<key prefixes> ("," = every shader; TOTK_BIND_TRACE_FROM=<frame>,
+  TOTK_BIND_TRACE_N=<count>): per encode, the textures / images / typed buffers (id, serial, memory, size, target, format,
+  first floats), the storage buffers (up to 64 words) and the uniform buffers (12 floats) a shader reads; with it also
+  [pool] lines (texture / sampler pool initialisation, bound pool changes, registrations and highest ID per pool).
+  TOTK_QUEUE_TRACE, TOTK_T2T_LOG, TOTK_REUP_LOG, TOTK_INV_LOG, TOTK_PRESENT_FINISH, TOTK_DESWZ_CPU. A zero-copy linear
+  texture tried on the way (2x1 exposure textures read from their pool) did not change anything and is not kept: those
+  textures are written by the CPU.
+
+**Pokopia, night 2026-11-03: the black frames fixed: a texture ID is checked against the bound texture pool.**
+- The exposure chain was a lead, not the cause: the final picture is the background layer (ser 5431) copied into the
+  window texture with the interface drawn over it, and in a black frame every render target was 0, the interface too.
+  Screen captures of the window (not only the game's own shots) showed the same 9 black of 12.
+- Pokopia makes three texture pools (33,024, 16,640 and 4,352 descriptors) and three sampler pools, registers its
+  textures in the first, about 143 new IDs a frame, wrapping from 32,992 to 256 every ~229 frames. The ID bound check
+  (an ID past the pool reads 0, as on hardware) took the capacity of the pool initialised last (4,352) and the replay
+  ignored nvnCommandBufferSetTexturePool: every texture from ID 4,352 on read as an empty slot. Only the ~30 frames after
+  each wrap had a picture. The log had said so all along ("池外贴图号 4352（池容量 4352）").
+- Now the replay keeps the bound pool's descriptor count in the draw state (OP_SET_TEX_POOL -> S.tex_pool_n) and the
+  check uses it. Texture IDs stay in one table for all pools, equal to hardware while one pool holds the registrations;
+  a red line marks the first registration in a second pool (the sign the table has to become per pool). Pokopia: 12 of
+  12 frames with a picture, past the language screen into its opening scene and the first area; Tears of the Kingdom
+  1.4.3 boots to its title (155 s) as before.
+
+**Pokopia, late 2026-11-03: the stalls in the world fixed: the control-memory callback is called.**
+- In the world the game stopped for 0.4-0.6 s every 1.5 s, worse the longer it ran. Time Profiler: the replay thread
+  spent the stalls in pin_scan; the log: 100,000 live recording copies (2 GiB) after four minutes, released none.
+- Pokopia gives each command buffer its control memory once (1 MiB, 3 MiB) and adds more only from its memory callback
+  (main+0x1144990, NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_CONTROL_MEMORY). The host never called it: past the memory a
+  recording carried no mark, the game never added memory again, and no copy was ever released.
+- Now a recording that needs control memory beyond what is left calls the game's callback first (ctl_ensure; not for
+  Breath of the Wild, whose handles are not in control memory), and the game adds memory: re-adding releases the copies
+  recorded there (release_copies). Marks are used with the translation thread too: copy_free already keeps a released
+  copy until every submission before it has been replayed; the sweep frees those waiting copies (retired_sweep).
+- Same save, five minutes: 29,000 live copies / 7.8 MiB (was 120,000 / 2.5 GiB), frames over 200 ms 4 (2.2 s; was 103,
+  59.5 s), 14,618 frames (was 11,722). Bananza 3 minutes as before (310 copies released by their marks), Tears of the
+  Kingdom 1.4.3 to its title (2,500 live copies, as before). TOTK_CTL_LOG=1: callbacks, control memory additions.
+- Still open for Pokopia: shaders compiled the first time a scene is entered (seconds, cached after); static
+  block-compressed textures re-uploaded every submission as written (~170 MB a frame, TOTK_REUP_LOG); a second texture
+  pool registering in some scenes (the table per pool); nvnCommandBufferDrawArraysIndirect and SetCopyImageStride.
+
+**Pokopia, 2026-11-04: packaged as a Mac app by build_app.py, its shaders prepared at packaging.**
+- `build_app.py <dump folder> --shared-fonts <folder>`: a folder as the game argument is a Switch 2 dump (base/,
+  updates/<version>/ with exefs/ and romfs/); the title ID in its main.npdm picks the game (NS2 table: Pokopia
+  0400A3A01EE4C000, update 655360), no keys. Steps: import_dump.py, the ExeFS / RomFS / rewrite checked against
+  games/pokopia/assets/expected-v2.0.1.json (the verified rewrite), `make runtime-pkp` (launcher with GAME_POKOPIA /
+  GAME_NS2), the shader seed, the startup libraries, the pipeline archive, the app (data folder Pokopia, bundle
+  org.macnativegames.pokopia). The shared fonts are a TOTK / BotW build's (a dump has none). Mac only.
+- Seed (scripts/prepare_ns2_seed.py): the corpus (ns2_shader_corpus.py), then the game binary's `seed-shaders
+  <corpus> <shared list>` translates every shader for the default bind state and for each bind state the list names
+  (totk_contrib_answers, so variants carry the list's names), into a cache kept in the work folder; the seed is that
+  cache's translations in prepare_shader_seed.py's layout (seed-manifest.json, shader-keys.json), so the TOTK app steps
+  take it as they are. Pokopia: 2,384 of 2,385 shaders, 21 s; 1,646 libraries.
+- Shared list games/pokopia/assets/shader_list.tsv (identifiers only): merged from development runs. `shader_list.py
+  merge` now renames a pso_user.tsv's on-the-spot variant names to the names a build gives (through the merged cache's
+  .variants, as the runtime does for contributions): 636 of 640 rows had been refused. The dkb / pokopia lists carry A
+  rows like TOTK's (OUR_RUNTIME).
+- Measured (the in-world save, an empty shader cache, 4 minutes): frames over 100 ms 29 / 16.9 s without the prepared
+  data, 29 / 14.2 s with the app; pipelines built in play 184 -> 90, libraries 190 -> 107; the title waited 3 ms. Every
+  shader translated in play (99) is one the game files do not hold: Pokopia makes some shaders itself while it runs
+  (xFractals/pokopia-native: 154 on 2.0.1, about 20 on the title screen; it records them and rebuilds). They are
+  translated on first use and cached by the player; open: start their translation when the game finishes writing them
+  instead of at the first draw. 337 warm rows of the list name such shaders and are left out of the app's lists.
+- Translating them early (2026-11-04, measured, off by default): TOTK_PROG_TIMING=1 logs each stage's key at
+  nvnProgramSetShaders and at the program's first draw. All 260 stages drawn in a 4-minute run had the key they had at
+  SetShaders (the code is final there), 150 ms to 20 s before their first draw; but the game sets 8,179 programs (8,026
+  shaders) in that time and draws 260. TOTK_SHADER_PREFETCH=2 translates every shader set without a cached
+  translation in the background and compiles its library: built in play 90 -> 21 pipelines, 107 -> 27 libraries, frames
+  over 100 ms 14.2 -> 10.9 s, but 6,207 translations and 2,456 libraries (about 930 s of thread time) at the first start,
+  and a 5.1 s stop of the game's own threads at the start (the CPU taken). Next: the same on two background threads of
+  low priority.
+- Found on the way: a signed program written over in place (cp onto a file that had run) is killed at launch (SIGKILL,
+  Code Signature Invalid): the seed tool replaces the translation service with a new file. GAME_NS2 reads
+  build/game-data/<v>/process.txt, now in the app's game data.
+
+**Pokopia, night 2026-11-04: all of its shaders found; one ID space per descriptor pool; two more NVN2 calls.**
+- The shader extractor missed 98 % of the game's shaders. scripts/ns2_shader_corpus.py found the control section from
+  other header fields and took it as 0xe0 bytes long; the GLSLC header gives the control section's offset (+0x60) and
+  the control section its own size (+0x30) and the code length (+0x44), as kirakira-dev/ouncenative's
+  nx2_shader_extract.py (MIT) reads them. Pokopia's files hold 131,090 distinct shaders (RDB data 130,904, LINKDATA 26,
+  modules 160), not 2,385; of the 8,026 the game set in a 4-minute run, 7,717 are among them (the earlier note that it
+  makes most of its shaders while it runs was wrong: about 65 drawn ones are in no file).
+- The seed takes the modules' and LINKDATA's shaders and those of the RDB data the shared list names (ns2_shader_corpus.py
+  --listed): all 131,090 would be about 23 GB of translations and libraries, and most are never loaded. The list holds the
+  keys the game was seen to set (8,556 shaders, identifiers only); the runtime adds, to the player's contribution file,
+  each shader the game sets that the seed lacks (totk_rt_note_set, GAME_NS2), so the list grows with play. shader_list.py
+  prune refuses a Switch 2 list (its V rows are what the seed translates).
+- One ID space per descriptor pool (seedds/nxnative's design, MIT): each texture / sampler pool gets a base in the host
+  table at its first initialisation; registrations go to base + ID, the handles a command buffer binds get the base of the
+  pool it last bound, and the replay's bound check takes base + size of the bound pool. Pokopia's second texture pool
+  registered textures over the first one's IDs in some scenes. Games with one pool of each kind keep base 0. Deferred
+  binds of a non-first pool are named in red (not rebased yet; Pokopia uses none).
+- nvnCommandBufferDrawArraysIndirect (the GPU reads {count, instances, first, base instance}) and
+  nvnCommandBufferSetCopyImageStride (the bytes between the 2D images of a 3D / array copy), both recorded as nxnative does.
+- Synchronous replay (the default since eec5983b) needs a replay section: Donkey Kong Bananza submits from two threads, and
+  their replays overlapped ("提交重入") and a memory-pool write-back on one thread used the other's upload batch. Submits,
+  presents and every operation that waited for the translation thread (x_drain: pool / program finalize, Read / Write
+  Texels, QueueFinish, suspend, memory-pool write-back) now hold a recursive lock with synchronous replay, and the thread
+  holding it is the upload batch's owner; with the translation thread the section is x_drain as before.
+- Measured (the in-world save, an empty shader cache, 4 minutes, the packaged app): frames over 100 ms 5.9 s (16.9 s
+  without the prepared data, 14.2 s with the first app), of them while building shaders 3.2 s; pipelines built in play
+  51, libraries 73. Bananza 3 minutes (11,700 frames) and Tears of the Kingdom 1.4.3 in the world (p50 9.6 ms) as before.
+- Open: recording copies still grow slowly in Pokopia (56,000 live, 129 MiB after 6 minutes); DrawArraysIndirect was not
+  called in the runs (no longer red); about 65 drawn shaders are made at run time (TOTK_SHADER_PREFETCH=2, to throttle);
+  the import step of build_app.py's Switch 2 path was not run end to end (the test work folder had the verified import).
 
 **Bananza regression found and fixed (2026-11-03 afternoon).** The vibration graph classes stubbed for Pokopia
 (VibrationNode, VibrationTarget, VibrationPlayer, VibrationNodeConnection, VibrationConverter) emptied their constructors:
@@ -234,3 +381,133 @@ about 6.9 ms); what was measured and planned:
   above) before each run. Compare GPU time and submit time, not frame time, while the game holds 60 fps.
 - Where the GPU time goes, per pass (games/totk/scripts/metal_perf_report.py, merged from main), before choosing the next
   GPU change; then mesh shaders (above).
+
+## Offline shader depth mode
+
+Offline preparation does not execute the game's `nvnDeviceSetDepthMode` call. Its depth mode must therefore be an
+explicit build input: Bananza uses `minus-w`, Pokopia uses `zero`, as observed in their device setup. `build_app.py`
+passes this to `prepare_ns2_seed.py --depth-mode`; direct `seed-shaders` invocations must set `TOTK_SEED_DEPTH_MODE`.
+For `minus-w`, vertex translation converts clip z to `(z+w)/2` for Metal. Applying the wrong convention can clip the
+entire fullscreen copy and leave the swapchain's previous contents on screen even with no missing shaders.
+
+The seed manifest records `nvn_depth_mode` and `translation_context_sha256` (runtime binary, translator and requested
+mode). Both offline translations and the app's writable shader cache use that context; changing it cannot reuse stale
+vertex translations under unchanged shader keys. Offline pipeline generation reads the mode from the same manifest.
+
+Verification uses one real fullscreen vertex shader translated in both modes: only `minus-w` must contain the clip-z
+conversion. On the device, capture the presented swapchain texture, the final draw's actual uniform/vertex data and
+consecutive frames, then check the visible cropped output as well as the window screenshot. A draw submission count
+alone does not prove that the rasterizer produced pixels. Use a save copy and verify the restored original's hashes.
+
+**Bananza custom rendering size (2026-11-04, Mac verified; iOS default 960x540 requested).**
+`TOTK_OUTPUT_RES=1280x720` (or e.g. `960x540`) selects the initial native render size. The v458752 framebuffer maximum
+getters at `main+0x5bf770/+0x5bf780` read an independent writable parameter page. Their original instructions are
+verified on the Mac and exported into the signed iOS code; the phone only verifies the code and fills the data.
+The verified `main+0x5399ec` copy publishes gsys's creation parameters. It skips the argument's 8-byte vtable:
+its 0x108-byte payload has flags, 24 extents at +4, six output scales at +0xc4 and a 20-byte tail. Only the extents
+and scales change. `ns2_resolution.h` defines and checks that layout; regression checks preserve the flags and tail
+and reject malformed, overflowing and mismatched inputs. No NVN texture-size matching or mip remapping is involved.
+Mac tests from save copies ran 1280x720 and 960x540 for about 70 s each, reached the mining tunnel and captured
+canvas PNGs, crops and main render targets at exactly the requested size. The default-size gsys constant alone
+is overwritten later and is insufficient. The iOS start screen offers 540p, 720p, 1080p and custom width x height;
+Settings has the same engine parameter, default 960x540 (user request). Original texture dimensions and full mip chains stay intact.
+
+The earlier iOS read-load Jetsam was VM page shortage near 4 GiB. A shared scratch-file heap mapping now defaults
+on for Bananza on iOS only (`TOTK_FILE_HEAP=0` for comparison); macOS and other games retain their earlier backing.
+The anonymous address/heap budget stays unchanged. The file is unlinked while mapped, so exit releases its disk space.
+On the iPhone 14, 512 MiB CPU write-back/page-in and Metal physical/virtual alias checks passed, followed by a 263 s
+original-resolution save-copy run that reached the tunnel without termination (peak footprint 1175 MiB; original
+save restored and all hashes matched). Loading and pipeline creation were slow; this is not a claim of sustained
+playable frame rate. The initial combined 720p/default-memory build was not installed because the phone disconnected.
+The requested 960x540 build was subsequently signature-verified and installed over USB; all seven original profile
+files matched their pre-install SHA-256 hashes. The first launch for verification was denied by iOS lock state,
+so this build has not yet been verified in the real iPhone game. The test profile was removed and the original
+profile restored with matching hashes. Evidence: external `codex/bananza-ios-20261104/{crash-after-save,resolution}/`.
+
+
+**Bananza Mac display settings and 4K verification (2026-11-04).** Mac now defaults to native 1920x1080
+when TOTK_OUTPUT_RES is absent. The Mac settings panel offers 540p, 720p, 1080p, 1440p, 4K and custom dimensions;
+it stores graphics-output-size.txt beside controls.txt. The initial implementation applied changes on the next launch;
+the live native rebuild described below supersedes that behavior. An explicit environment value sets the initial size.
+
+4K needs the complete native memory chain. The graphics creation argument copied at main+0x53a068 has its
+200 MiB primary dynamic render-pool budget at copied payload +0x20; the adjacent +0x28 is a 32 MiB fallback
+block size, and the fallback heap is null in the real failure. The first attempted fallback-size change did
+not affect the primary pool and was removed. The primary pool is now scaled by requested pixels above 1080p,
+rounded to 64 KiB (4K: 800 MiB). Its parent GSys heap, from
+System/HeapSize/Product.Nin_Ounce_NVN2.HeapDef.byml.zs, starts at 518144 KiB. Grow it by exactly the same delta
+(4K: +614400 KiB), and add that delta to the reported application budget so other heap budgets stay intact.
+Growing the primary pool alone cannot fit it into the original parent heap. The shared output-overlay builder
+supports --version dkb, validates the original values and changes only GSys's Size field. The normal NS2 build
+prepares 2560x1440 and 3840x2160; a custom size above 1080p needs its matching generated overlay.
+
+Final real Mac tests used save copies and no TOTK_OUTPUT_RES override: default 1080p ran about 70 s, and a saved
+4K setting ran about 121 s. Both reached the mining tunnel, captured native canvas PNGs at the requested size,
+and exited normally. The 4K run's later footprint was about 5171 MiB. The setting was also selected in the actual
+Mac menu and its saved file checked. Original texture dimensions, mip chains and effects were retained. These
+are short load/image checks, not long gameplay or frame-rate acceptance. Evidence: external
+codex/bananza-ios-20261104/resolution/mac-display-verification.json and mac-final-display-* directories.
+The desktop command and installed 960x540 iPhone build have not been replaced by these Mac tests.
+
+
+**Desktop entry installed (2026-11-04).** The existing `大金刚 Bananza.command` now starts the verified native
+binary in the external `codex/bananza-ios-20261104/work/totk` tree. The player's original `play/profile` and
+`run1/cache` paths are retained. Settings persist in `Application Support/MacNativeGames/Bananza` (a link to the
+external artifact volume), including `graphics-output-size.txt`; keyboard 1 opens the panel. Default output stays
+1080p until changed. The previous desktop entry is backed up beside `resolution/desktop-entry-record.json`,
+which binds the entry to the exact executable tested and records the unchanged save hashes. Creating the entry
+did not start the player's game. A per-launch command file lets the existing idle watchdog request a normal close.
+The latest shared sources also compile for generic iOS. The installed phone remains the previous 960x540 build;
+its exact-size real-game verification is still blocked by the phone's lock state. Full Mac-settings parity on iOS
+has been requested and remains unimplemented.
+
+Pre-commit validation also ran 1452 repository tests (7 skipped). The first run found one stale assertion counting
+two device-translator build routes, updated for NS2's third route, and three synthetic update-helper scripts whose
+shebang could not name a venv interpreter path containing spaces. The failing cases plus the complete device-translator
+group passed a targeted 9-test recheck with a space-free path for those stdlib-only child fixtures. The complete suite
+was not repeated after this targeted remediation. No game data, saves or raw captures are included in the commit.
+
+**Live NS2 resolution and camera aspect (2026-11-04, Mac checkpoint).** Bananza and Pokopia settings now queue
+native display changes during the current game. The resolution row, custom dimensions and 16:9 / 16:10 / 21:9 /
+32:9 choices share that path and save the resulting dimensions. Windowed content follows the chosen size, scaled
+proportionally to the available screen; fullscreen window bounds stay unchanged. Rounded-pixel capacity checks keep
+32:9 at exactly 3840x1080 instead of losing a row to float rounding. Mac defaults remain 1920x1080.
+
+Bananza's native display object belongs to SystemTask+0xd8. Its display calculation at main+0x30f85c consumes one
+packed request, updates its native mode extents and invalidates the cached mode. The original renderer then rebuilds
+its targets. With the prepared 4K overlay, framebuffer capacity, the dynamic render pool, GSys parent and application
+budget reserve 3840x2160 while rendering at the selected extent. Pokopia snapshots requests before main+0x22d598,
+uses the native size getters, then invalidates the cached mode after the committed canvas changes at +0x22d648.
+Its bounded Resize(width,height,maxWidth,maxHeight) reserves both color and depth capacity. Reserving color alone
+failed when an FSR view retained old 1080p color while depth had shrunk to 720p: native RT-stack Push rejected the
+mismatched extents. Its +0x2964 is stack depth, not a frame index; the fix preserves the native target lifecycle.
+
+Scene-camera aspect is updated before native projection/frustum construction: Bananza's registered projection
+transfer (+0x31f3bc), and Pokopia's active gameplay-camera/render-view transfer (+0x8cd884). These change camera-owned
+source parameters and invoke native cache updates; they do not stretch the final image or rewrite GPU matrices.
+Pokopia also updates the selected standard UI camera's logical canvas before its per-frame snapshot (+0x1f9bcc8).
+The native setter rebuilds the camera and adapter together. Custom UI cameras bypass this standard-camera path.
+
+Real Mac save-copy runs continuously switched 16:9, 21:9, 32:9 and 16:10 and returned to 16:9. Both scene projections
+matched the requested ratios and exposed additional horizontal world view. Pokopia's clean UI run lasted 161 s,
+exited 0 and kept B/X icons at 30x30 pixels in 21:9; their horizontal position moved into a centered safe area.
+Both original profiles matched their pre-run hashes. Earlier live-resolution runs also covered 540p through 4K;
+Pokopia fullscreen bounds remained 3440x1440 across render-size changes. These are short correctness checks, not
+long-session or performance acceptance. Evidence is outside the repository in codex/bananza-live-resolution:
+dkb-camera-7, pkp-camera-6, pkp-live-5 and pkp-ui-final.
+
+**Still open:** Bananza HUD aspect. Its scene is wide, but the last controlled UI comparison measured a heart at
+43x31 pixels in 16:9 versus 56x31 in 21:9. Updating an outer DrawInfo did not resolve the authored root projection.
+The experimental HUD changes are excluded from this checkpoint and retained externally under pending-hud.
+The most recent root-pane run had additional settings changes and is not accepted as a controlled comparison.
+This checkpoint does not claim complete Bananza ultrawide UI support. It also does not add the full Mac settings
+panel to iOS or claim new phone gameplay verification; the installed phone remains the earlier 960x540 build.
+
+Checkpoint validation: both Mac runtimes built; the Bananza app built for generic iOS, and Pokopia's NS2 patch
+translation unit compiled for arm64 iOS. No new phone installation or device gameplay test was performed. The six
+resolution/aspect/memory regressions and 19 settings/iOS-packaging checks passed. Full discovery ran 1454 tests
+in 291 s with seven skips and three errors in synthetic hactool fixtures: their shebang used the venv interpreter's
+space-containing path, so the OS could not launch them. With a separate space-free venv entry using the same installed
+dependencies, all 15 update tests passed in 2.7 s; no product or test-source workaround was applied. Full discovery
+was not repeated after that environment-only recheck. Logs and source/executable hashes are in the external
+commit-validation.json, commit-tests.log, commit-updates-recheck.log and commit-*-build.log files.
