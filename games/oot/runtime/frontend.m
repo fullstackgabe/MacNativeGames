@@ -398,8 +398,9 @@ static NSString *hud_settings_hint(void) {
   NSFont *mono=[NSFont monospacedSystemFontOfSize:10.5 weight:NSFontWeightMedium];
   NSColor *green=[NSColor colorWithCalibratedRed:80/255.0 green:1 blue:120/255.0 alpha:1],*yellow=[NSColor colorWithCalibratedRed:1 green:230/255.0 blue:40/255.0 alpha:1];
   NSMutableAttributedString *a=[NSMutableAttributedString new];
-  int full=fps_overlay_full_hud();   // FPS only: the FPS line (line 0); the others keep their last text, so skip them
-  for(int i=0;i<4;i++){char t[128];int hl=0;if((!full&&i!=0)||!hud_snapshot(i,t,sizeof t,&hl))continue;   // FPS, shaders, render pipelines, load
+  // hud_line_shown: which lines the overlay choice shows (the hidden ones keep their last text, so they are skipped)
+  static const int order[]=HUD_ORDER;   // FPS, shaders, libraries, render pipelines, in play, the other kinds, the rest, load (user 2026-11-16: "都要显示")
+  for(int o=0;o<(int)(sizeof order/sizeof *order);o++){int i=order[o];char t[HUD_TEXT_MAX];int hl=0;if(!hud_line_shown(i)||!hud_snapshot(i,t,sizeof t,&hl))continue;
    [a appendAttributedString:[[NSAttributedString alloc] initWithString:[([NSString stringWithUTF8String:t] ?: @"") stringByAppendingString:@"\n"] attributes:@{NSFontAttributeName:mono,NSForegroundColorAttributeName:hl?yellow:green}]];}
   if(!a.length)[a appendAttributedString:[[NSAttributedString alloc] initWithString:@"FPS --\n" attributes:@{NSFontAttributeName:mono,NSForegroundColorAttributeName:green}]];
   if(playtime)[a appendAttributedString:[[NSAttributedString alloc] initWithString:[playtime.text stringByAppendingString:@"\n"]
@@ -631,15 +632,25 @@ static CGPathRef mirror_path(CGSize z,int eye){   /* +1; eye -1: the whole recta
 #define TOTK_SCREENSHOT_WINDOW 1
 #endif
 #if defined(TOTK_SCREENSHOT_WINDOW) && !defined(TOTK_SCREENSHOT_PICTURE)
-/* The renderer's next frame: mtl_grab_next_present (third_party/d2r_gfx/gfx/nvn/nvn_mtl.m) has the present thread draw the
-   frame it is about to show and hands the picture over when the GPU is done, so the capture button waits on no thread and
-   the main thread never spins. Weak: a probe links this file without the renderer and answers with no picture. */
+/* The renderer's next frame: mtl_grab_next_game_frame (third_party/d2r_gfx/gfx/nvn/nvn_mtl.m) has the present thread copy
+   the game's own frame -- the source texture before the output upscale, no letterbox bars -- and hands the picture over
+   when the GPU is done, so the capture button waits on no thread and the main thread never spins. A renderer that only
+   offers the window picture (mtl_grab_next_present) gets that instead; weak, so a probe links this file without the
+   renderer and answers with no picture. */
 extern void mtl_grab_next_present(void (^cb)(CGImageRef img)) __attribute__((weak_import));
-static void screenshot_picture(void (^cb)(CGImageRef img)) { if (mtl_grab_next_present) mtl_grab_next_present(cb); else cb(NULL); }
+extern void mtl_grab_next_game_frame(void (^cb)(CGImageRef img)) __attribute__((weak_import));
+static void screenshot_picture(void (^cb)(CGImageRef img)) {
+    if (mtl_grab_next_game_frame) mtl_grab_next_game_frame(cb);
+    else if (mtl_grab_next_present) mtl_grab_next_present(cb);
+    else cb(NULL);
+}
 #define TOTK_SCREENSHOT_PICTURE screenshot_picture
 #endif
 #include "screenshot.h"
 #include "settings_panel.h"
+#if defined(TOTK_SCREENSHOT_WINDOW)
+#include "shot_upload.h"   /* 截图分享: with its switch on, each saved screenshot is shared (screenshot.h totk_screenshot_shared) */
+#endif
 void runtime_front_resize_output(unsigned w,unsigned h) {
  dispatch_async(dispatch_get_main_queue(),^{settings_window_size(w,h,h?(double)w/h:0);});
 }
@@ -956,6 +967,10 @@ void runtime_front_run(void(*callback)(void)){
   if(window.level==NSFloatingWindowLevel){NSRect f=window.frame;[window setFrameOrigin:NSMakePoint(NSMaxX(vis)-f.size.width,NSMaxY(vis)-f.size.height)];}   /* TOTK_WINDOW_FLOAT: top-right corner */
   front_sync_drawable();
   if(assume_focus()){[window orderFrontRegardless];}else{[window makeKeyAndOrderFront:nil];[NSApp activateIgnoringOtherApps:YES];}   /* in front of other apps' windows, keyboard left alone */
+  totk_board_start();   /* the leaderboard's rounds (board_upload.h): nothing is sent unless the player turned 我要上榜 on */
+#if defined(TOTK_SCREENSHOT_WINDOW)
+  totk_screenshot_shared=totk_shot_queue;totk_shot_start();   /* 截图分享 (shot_upload.h): off unless the player turned it on */
+#endif
   front_sr_view();
   [NSNotificationCenter.defaultCenter addObserverForName:NSApplicationDidChangeScreenParametersNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n){(void)n;note_window_screen();front_sr_view();}];   /* a refresh rate changed on the same screen */
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW,3*NSEC_PER_SEC),dispatch_get_main_queue(),^{note_occlusion(" 3 s after opening");});
