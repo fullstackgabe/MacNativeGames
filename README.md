@@ -36,11 +36,11 @@ that runtime in [`games/oot`](games/oot/README.md).
 | Game | Version | Platform | Status |
 |---|---|---|---|
 | The Legend of Zelda: Ocarina of Time | update 131072 | Mac | Playable from the title into Kokiri Forest and the village on an M4, not played through; resolution, MetalFX upscaling, frame lock and frame interpolation in the settings panel; [`games/oot`](games/oot/README.md), [install](games/oot/docs/install.md) |
-| Donkey Kong Bananza | update 458752 | Mac | Playable, early; not fully tested |
+| Donkey Kong Bananza | update 458752 | Mac | Playable, early; not fully tested. Builds from a `.nup` or a dump folder, with its add-on content (Emerald Rush loads; not played through) |
 | Pokémon Pokopia | 2.0.1 | Mac | Early: plays its opening into the first area (scripted test, not fully played). |
 | Mario Kart World | 1.0.0 | Mac | Community port, experimental; [build instructions](games/mkw/README.md) |
 
-Ocarina of Time and Pokopia package as a Mac app with `build_app.py`. Not yet: iPhone / iPad (a build path for Ocarina of Time is being tested), DLC.
+Ocarina of Time, Donkey Kong Bananza and Pokopia package as a Mac app with `build_app.py`. Not yet: iPhone / iPad (a build path for Ocarina of Time is being tested), add-on content other than Bananza's.
 
 ### Switch 1 games
 
@@ -49,7 +49,7 @@ Ocarina of Time and Pokopia package as a Mac app with `build_app.py`. Not yet: i
 | The Legend of Zelda: Tears of the Kingdom | 1.0.0, 1.2.1, 1.4.3 | Mac (up to native 4K on 1.2.1 and 1.4.3; 5K by default on 32 GB-plus Macs with 1.4.3), iPhone, iPad; Apple Vision Pro (windowed, early) | Supported | [`games/totk`](docs/install.md) ([Vision Pro](docs/install.md#apple-vision-pro)) |
 | The Legend of Zelda: Breath of the Wild | 1.6.0, 1.9.0 | Mac (up to native 4K); 1.6.0 also on iPhone and iPad | Supported | [`games/totk`](docs/install.md#breath-of-the-wild) (shared runtime), list in `games/botw` |
 | Super Smash Bros. Ultimate | 13.0.2, 13.0.5 | Mac | Community port | [`games/ssbu`](games/ssbu/README.md) |
-| Super Mario Odyssey | 1.3.0, 1.4.1 | Mac | Community port, early | [`games/odyssey`](games/odyssey/README.md) |
+| Super Mario Odyssey | 1.3.0, 1.4.1 | Mac | Community port, early; built from MNG Launcher | [`games/odyssey`](games/odyssey/README.md) |
 | Bayonetta 3 | 1.2.0 | Mac | Community port, work in progress | [`games/by3`](games/by3/README.md) |
 | Super Mario Bros. Wonder | 1.0.0, 1.2.1 | Mac | Community port, early | [`games/wonder`](games/wonder/README.md) |
 | Pokémon Legends: Arceus | 1.1.1 | Mac | Community port, early | [`games/pla`](games/pla/README.md) |
@@ -59,22 +59,29 @@ Ocarina of Time and Pokopia package as a Mac app with `build_app.py`. Not yet: i
 | Mario vs. Donkey Kong | 1.0.1 | Mac | Community port, early | [`games/mvdk`](games/mvdk/README.md) |
 | Metroid Dread | 2.1.0 (base + update) | Mac (validated); iPhone / iPad scripts updated, not yet built or validated on 2.1.0 | Community port, early | [`games/dread`](games/dread/README.md) |
 | Unicorn Overlord (Asian release) | 1.05 | Mac | Community port, early; DLC optional | [`games/unicorn`](games/unicorn/README.md) |
-| The Legend of Zelda: Echoes of Wisdom | 1.1.0 | Mac | Community port, early | [`games/eow`](games/eow/README.md) |
-| Animal Crossing: New Horizons | 1.2.1; 3.0.1 (experimental) | Mac | Community port | [`games/acnh`](games/acnh/README.md) |
+| The Legend of Zelda: Echoes of Wisdom | 1.1.0 | Mac | Community port, early; an app, built from MNG Launcher | [`games/eow`](games/eow/README.md) |
+| Animal Crossing: New Horizons | 1.2.1; 3.0.1, 3.0.3 (experimental) | Mac | Community port; 3.0.3 builds from MNG Launcher, 60 FPS, 120 FPS on a 120 Hz screen | [`games/acnh`](games/acnh/README.md) |
 | Octopath Traveler 0 | 1.0.3, 1.0.4, 1.0.5 | Mac | Community port, work in progress | [`games/ot0`](games/ot0/README.md) |
-| Hyrule Warriors: Age of Calamity | 1.3.0, 1.4.1 | Mac | Community port, experimental | [`games/aoc`](games/aoc/README.md) |
-| Mario Kart 8 Deluxe | 4.0.1 | Mac | Community port, early | [`games/mk8d`](games/mk8d/README.md) |
+| Hyrule Warriors: Age of Calamity | 1.3.0, 1.4.1 | Mac | Community port, experimental. A rewrite on the Zelda runtime (1.4.1) reaches the first battle at 30 fps; it has no Mac app yet | [`games/aoc`](games/aoc/README.md), [`games/aocx`](games/aocx/README.md) |
+| Mario Kart 8 Deluxe | 4.0.1 | Mac | Community port, early. A rewrite on the Zelda runtime plays VS and Grand Prix races at 60 fps; it has no Mac app yet | [`games/mk8d`](games/mk8d/README.md), [`games/mk8dx`](games/mk8dx/README.md) |
 | Kirby and the Forgotten Land | 1.0.0 | Mac | Community port, early | [`games/kirby`](games/kirby/README.md) |
 | Luigi's Mansion 3 | 1.2.0 | Mac | Community port, work in progress; playable | [`games/lm3`](games/lm3/README.md) |
 | Astral Chain | 1.0.1 | Mac | Community port, work in progress; the first frame is presented and the title flow runs | [`games/alc`](games/alc/README.md) |
-| Xenoblade Chronicles 3 | 1.0.0, 2.2.1 | Mac | Community port, playable; a few shaders translate on first use | [`games/xc3`](games/xc3/README.md) |
+| Xenoblade Chronicles 3 | 1.0.0, 2.2.1 | Mac | Community port, playable; one-command build; a few shaders translate on first use | [`games/xc3`](games/xc3/README.md) |
 | Pokémon Violet | 4.0.0 | Mac | Community port, work in progress | [`games/pokesv`](games/pokesv/README.md) |
 | Xenoblade Chronicles X: Definitive Edition | 1.0.0; 2.0.0 (diagnostic) | Mac | Community diagnostic host, early field gameplay; external work folder required | [`games/xcx`](games/xcx/README.md) |
 | Tomodachi Life: Living the Dream | 1.0.0 | Mac | Community port, experimental | [`games/tomodachi`](games/tomodachi/README.md) |
 | The Legend of Zelda: Link's Awakening | 1.1.0 | Mac | Community port, experimental | [`games/la`](games/la/README.md) |
 | The Legend of Zelda: Skyward Sword HD | 1.0.1 | Mac | Community port, experimental | [`games/ss`](games/ss/README.md) |
+| Teenage Mutant Ninja Turtles: Shredder's Revenge | 1.0.0 | Mac; iPad target | Community port, experimental; not yet validated as a complete game | [`games/tmnt`](games/tmnt/README.md) |
+| Persona 5 Royal | 1.0.2 | Mac | Early: title, menus and the opening casino at the game's 30 fps, as a Mac app; battles and longer saves not tested | [`games/p5r`](games/p5r/README.md) |
+| Red Dead Redemption | 1.0.4 | Mac; the iPhone / iPad app builds, not run on a device | Bring-up: plays to Armadillo Station at 30 fps; glass and some distant objects draw wrongly; no Mac app yet | [`games/rdr`](games/rdr/README.md) |
+| The Witcher 3: Wild Hunt | 4.04b | Mac | Bring-up: the first in-engine scene, and gameplay at Kaer Morhen from a save, at 30 fps; no Mac app yet | [`games/w3`](games/w3/README.md) |
+| 明星三缺一 2013 | v0 | Mac | Early: title, menus and a game of mahjong against the AI at 30 fps, as a Mac app | [`games/mj2013`](games/mj2013/README.md) |
 
-Community ports keep their own runtime, graphics layer and scripts in their folder and are built with the steps there.
+Community ports keep their own runtime, graphics layer and scripts in their folder.
+
+**MNG Launcher** builds Tears of the Kingdom, Breath of the Wild, Ocarina of Time, Donkey Kong Bananza, Pokémon Pokopia, Metroid Dread, TMNT: Shredder's Revenge, Animal Crossing: New Horizons, Echoes of Wisdom and Super Mario Odyssey. Launcher 1.1.3 also builds Skyward Sword HD and WORLDEND SYNDROME; later releases do not. Every other game here is built with the steps in its folder.
 
 ### VR: Tears of the Kingdom and Breath of the Wild on a Meta Quest 3 (6DoF)
 
@@ -112,7 +119,7 @@ repository.
 
 ### Recommended install
 
-> **Hand it to an AI assistant.** Open this repository in Claude Code, Codex, or any other AI assistant you like, tell it where your own game file and `prod.keys` are, and ask it to build and install the app and to sort out whatever comes up on your Mac. It follows the [install skill](.claude/skills/install-zelda/SKILL.md), runs every step and checks the result; you just wait with a coffee. Installing and testing by hand is not recommended: there are many steps, and every Mac, game version and dump is a little different. That's why I haven't provided a one-click build option: an AI assistant is my one-click build option. For Red Alert 2 it needs only your own Steam install (no `prod.keys`) and follows [its own skill](.claude/skills/install-ra2/SKILL.md).
+> **Hand it to an AI assistant.** Open this repository in Claude Code, Codex, or any other AI assistant you like, tell it where your own game file and `prod.keys` are, and ask it to build and install the app and to sort out whatever comes up on your Mac. It follows the [install skill](.claude/skills/install-zelda/SKILL.md), runs every step and checks the result; you just wait with a coffee. Installing and testing by hand is not recommended: there are many steps, and every Mac, game version and dump is a little different. If you prefer a window, [MNG Launcher](docs/install.md#mng-launcher-the-window) builds the games named above the VR section: download its signed DMG from [Releases](https://github.com/ly05010419/MacNativeGames/releases). For Red Alert 2 it needs only your own Steam install (no `prod.keys`) and follows [its own skill](.claude/skills/install-ra2/SKILL.md).
 
 ### Install skill
 
@@ -125,7 +132,7 @@ repository.
 > [!TIP]
 > **Every shader in the shared list is ready before you play.** On a Mac the game does not stop to compile it, and on an iPhone or iPad nothing is missing from the picture. The more places players cover, the smoother the game gets for everyone.
 
-The [shared shader list](docs/shader-list.md) now holds **18,290 shader variants** (14,727 shaders) from the Mac, iPhone and iPad: only states a build does not make by itself, since every build makes each shader's default variant. Every build makes them from the player's own game files, so the list holds identifiers only, never game data. Helping takes no setup:
+The [shared shader list](docs/shader-list.md) now holds **18,365 shader variants** (14,760 shaders) from the Mac, iPhone and iPad: only states a build does not make by itself, since every build makes each shader's default variant. Every build makes them from the player's own game files, so the list holds identifiers only, never game data. Helping takes no setup:
 
 1. **Play.** Every build carries each shader of the game for its default bind state. When your game meets a shader in a state that variant does not serve, or builds a render pipeline the app's list lacks, it notes it in `shader-list-contribution.txt`; default variants are never noted.
 2. **Once the file holds 100 new rows (shaders and pipelines together), the game asks you one question before it starts**, the same on a Mac, iPhone and iPad. With "Contribute shaders" the game sends the rows over HTTPS to the shader inbox ([mac-native-games.com](https://mac-native-games.com)) on its own, shortly after it starts and then every half hour, and never interrupts your play. "Don't contribute" sends nothing. The switch in Settings changes your answer at any time.
@@ -135,9 +142,22 @@ Only shader and pipeline identifiers, the game and app versions, the device mode
 
 **Stuttering when you first start playing or enter a new scene is expected while new shaders compile—don't be surprised.** Performance typically improves as the cache warms up, and every shader the [shared list](#lets-maintain-the-shader-list-together-no-more-stutter) gains is one nobody stutters on again.
 
+## Counting active players
+
+The MNG Launcher and every game report **at most once a day** to [mac-native-games.com](https://mac-native-games.com), so we can count daily, weekly and monthly players and how many stop playing. A report holds four things only: a random install id of the device (on a Mac one file, `~/Library/Application Support/MacNativeGames/install-id.txt`, shared by the Launcher and every game; on an iPhone or iPad a hash of the app's vendor id), the program (Launcher or the game), the platform and the version. No name, account, game file, save or IP address is kept; the site stores the id only as a salted hash and deletes the rows after 120 days.
+
+It is **on by default**. To turn it off: on a Mac, **MNG Launcher › Settings…** (⌘,) and untick *Count me as an active player* — this stops it for the Launcher and every game of the Mac (it writes the file `usage-stats-off` beside `install-id.txt`); on an iPhone or iPad, the game's page in the **Settings** app.
+
 ## What's new
 
+- **2026-11-23: Donkey Kong Bananza builds from a `.nup` or a dump folder, with its add-on content (Mac).** Emerald Rush loads from your own files; it has not been played through.
+- **2026-11-23: Pokémon Pokopia's picture is no longer too dark (Mac).**
+- **2026-11-23: Persona 5 Royal 1.0.2 and The Witcher 3 4.04b on Mac, early.** Persona 5 Royal reaches the opening casino as a Mac app ([games/p5r](games/p5r/README.md)); The Witcher 3 plays at Kaer Morhen from a save, without an app yet ([games/w3](games/w3/README.md)).
+- **2026-11-22: Red Dead Redemption 1.0.4 and 明星三缺一 2013 on Mac, early.** Red Dead Redemption plays to Armadillo Station, without an app yet ([games/rdr](games/rdr/README.md)); 明星三缺一 plays a game of mahjong as a Mac app ([games/mj2013](games/mj2013/README.md)).
+- **2026-11-22: Age of Calamity and Mario Kart 8 Deluxe have rewrites on the Zelda runtime, without an app yet** ([games/aocx](games/aocx/README.md), [games/mk8dx](games/mk8dx/README.md)).
+- **2026-11-22: Breath of the Wild's Game Over title and cutscene name cards no longer show the wrong characters.**
 - **2026-11-14: WORLDEND SYNDROME 1.0.0 on Mac, experimental.** Built from your own base files; title through ADV, saves and the first loop were played ([games/worldend](games/worldend/README.md)).
+- **2026-11-13: experimental TMNT Mac source port.** Private-input build tools and host source are available under [`games/tmnt`](games/tmnt/README.md); complete playability and iOS are not validated.
 - **2026-11-11: Rankings, an anonymous frame-rate board (Tears of the Kingdom, Breath of the Wild, Ocarina of Time, Mac).**
   A settings tab of its own (key 1) shows the latest board, one group per frame lock and interpolation setting. **Join the
   board** is off by default and never asked; once on, the session is kept on your Mac every 5 minutes and sent at start and
@@ -235,11 +255,11 @@ Switch 2 游戏在《王国之泪》同一套运行时上运行：它们的 Ampe
 | 游戏 | 版本 | 平台 | 状态 |
 |---|---|---|---|
 | 塞尔达传说 时之笛 | 更新 131072 | Mac | 在 M4 上从标题玩进科奇里森林和村子，没有通关；设置面板里有分辨率、MetalFX 放大、锁帧和补帧；[`games/oot`](games/oot/README.md)，[安装](games/oot/docs/install.zh-CN.md) |
-| 大金刚 Bananza | 更新 458752 | Mac | 初步可玩，早期，未完整测试 |
+| 大金刚 Bananza | 更新 458752 | Mac | 初步可玩，早期，未完整测试。可以用 `.nup` 或导出目录打包，带追加内容（Emerald Rush 能加载，没有玩通） |
 | 宝可梦 Pokopia | 2.0.1 | Mac | 早期：能玩过开场进到第一个区域（脚本测试，没有完整玩过）。 |
 | 马力欧卡丁车 世界 | 1.0.0 | Mac | 社区移植，实验性；[构建说明](games/mkw/README.md) |
 
-时之笛和 Pokopia 可以用 `build_app.py` 打包成 Mac App。还没有：iPhone / iPad（时之笛的打包路径在测试中）、DLC。
+时之笛、大金刚 Bananza 和 Pokopia 可以用 `build_app.py` 打包成 Mac App。还没有：iPhone / iPad（时之笛的打包路径在测试中）、大金刚以外的追加内容。
 
 ### Switch 1 游戏
 
@@ -248,7 +268,7 @@ Switch 2 游戏在《王国之泪》同一套运行时上运行：它们的 Ampe
 | 塞尔达传说 王国之泪 | 1.0.0、1.2.1、1.4.3 | Mac（1.2.1 和 1.4.3 最高原生 4K，1.4.3 在 32 GB 及以上内存的 Mac 默认带 5K）、iPhone、iPad；Apple Vision Pro（窗口内游玩，早期） | 正式支持 | [`games/totk`](docs/install.zh-CN.md)（[Vision Pro](docs/install.zh-CN.md#apple-vision-pro)） |
 | 塞尔达传说 旷野之息 | 1.6.0、1.9.0 | Mac（最高原生 4K）；1.6.0 也能在 iPhone 和 iPad 上玩 | 正式支持 | [`games/totk`](docs/install.zh-CN.md#旷野之息)（共用运行时），清单在 `games/botw` |
 | 任天堂明星大乱斗 特别版 | 13.0.2、13.0.5 | Mac | 社区移植 | [`games/ssbu`](games/ssbu/README.md) |
-| 超级马力欧 奥德赛 | 1.3.0、1.4.1 | Mac | 社区移植，早期 | [`games/odyssey`](games/odyssey/README.md) |
+| 超级马力欧 奥德赛 | 1.3.0、1.4.1 | Mac | 社区移植，早期；可在 MNG Launcher 里打包 | [`games/odyssey`](games/odyssey/README.md) |
 | 猎天使魔女 3 | 1.2.0 | Mac | 社区移植，开发中 | [`games/by3`](games/by3/README.md) |
 | 超级马力欧兄弟 惊奇 | 1.0.0、1.2.1 | Mac | 社区移植，早期 | [`games/wonder`](games/wonder/README.md) |
 | 宝可梦传说 阿尔宙斯 | 1.1.1 | Mac | 社区移植，早期 | [`games/pla`](games/pla/README.md) |
@@ -258,22 +278,29 @@ Switch 2 游戏在《王国之泪》同一套运行时上运行：它们的 Ampe
 | 马力欧 vs. 大金刚 | 1.0.1 | Mac | 社区移植，早期 | [`games/mvdk`](games/mvdk/README.md) |
 | 密特罗德 生存恐惧 | 2.1.0（本体 + 更新） | Mac（已验证）；iPhone / iPad 脚本已更新，尚未在 2.1.0 上构建或验证 | 社区移植，早期 | [`games/dread`](games/dread/README.md) |
 | 圣兽之王（亚洲版） | 1.05 | Mac | 社区移植，早期；DLC 可选 | [`games/unicorn`](games/unicorn/README.md) |
-| 塞尔达传说 智慧的再现 | 1.1.0 | Mac | 社区移植，早期 | [`games/eow`](games/eow/README.md) |
-| 集合啦！动物森友会 | 1.2.1；3.0.1（实验性） | Mac | 社区移植 | [`games/acnh`](games/acnh/README.md) |
+| 塞尔达传说 智慧的再现 | 1.1.0 | Mac | 社区移植，早期；有 App，可在 MNG Launcher 里打包 | [`games/eow`](games/eow/README.md) |
+| 集合啦！动物森友会 | 1.2.1；3.0.1、3.0.3（实验性） | Mac | 社区移植；3.0.3 可在 MNG Launcher 里打包，60 帧，120 Hz 屏幕上 120 帧 | [`games/acnh`](games/acnh/README.md) |
 | 歧路旅人0 | 1.0.3、1.0.4、1.0.5 | Mac | 社区移植，开发中 | [`games/ot0`](games/ot0/README.md) |
-| 塞尔达无双 灾厄启示录 | 1.3.0、1.4.1 | Mac | 社区移植，实验 | [`games/aoc`](games/aoc/README.md) |
-| 马力欧卡丁车8 豪华版 | 4.0.1 | Mac | 社区移植，早期 | [`games/mk8d`](games/mk8d/README.md) |
+| 塞尔达无双 灾厄启示录 | 1.3.0、1.4.1 | Mac | 社区移植，实验。塞尔达运行时上的重写版（1.4.1）能打到第一场战斗，30 帧，还没有 Mac App | [`games/aoc`](games/aoc/README.md)、[`games/aocx`](games/aocx/README.md) |
+| 马力欧卡丁车8 豪华版 | 4.0.1 | Mac | 社区移植，早期。塞尔达运行时上的重写版能跑对战和大奖赛，60 帧，还没有 Mac App | [`games/mk8d`](games/mk8d/README.md)、[`games/mk8dx`](games/mk8dx/README.md) |
 | 星之卡比 探索发现 | 1.0.0 | Mac | 社区移植，早期 | [`games/kirby`](games/kirby/README.md) |
 | 路易吉洋馆3 | 1.2.0 | Mac | 社区移植，开发中；可以玩 | [`games/lm3`](games/lm3/README.md) |
 | 异界锁链 | 1.0.1 | Mac | 社区移植，开发中；能出第一帧，标题流程能走 | [`games/alc`](games/alc/README.md) |
-| 异度神剑3 | 1.0.0、2.2.1 | Mac | 社区移植，可玩；少数着色器首次使用时才翻译 | [`games/xc3`](games/xc3/README.md) |
+| 异度神剑3 | 1.0.0、2.2.1 | Mac | 社区移植，可玩；一条命令打包；少数着色器首次使用时才翻译 | [`games/xc3`](games/xc3/README.md) |
 | 宝可梦 紫 | 4.0.0 | Mac | 社区移植，开发中 | [`games/pokesv`](games/pokesv/README.md) |
 | 异度神剑 X 终极版 | 1.0.0；2.0.0（诊断） | Mac | 社区诊断宿主，首区域可探索；需要外部工作目录 | [`games/xcx`](games/xcx/README.md) |
 | 朋友收集 梦想生活 | 1.0.0 | Mac | 社区移植，实验性 | [`games/tomodachi`](games/tomodachi/README.md) |
 | 塞尔达传说 织梦岛 | 1.1.0 | Mac | 社区移植，实验性 | [`games/la`](games/la/README.md) |
 | 塞尔达传说 御天之剑 HD | 1.0.1 | Mac | 社区移植，实验性 | [`games/ss`](games/ss/README.md) |
+| 忍者神龟：施莱德的复仇 | 1.0.0 | Mac；有 iPad 目标 | 社区移植，实验性；还没有作为完整游戏验证过 | [`games/tmnt`](games/tmnt/README.md) |
+| 女神异闻录 5 皇家版 | 1.0.2 | Mac | 早期：标题、菜单和开场赌场，游戏原本的 30 帧，有 Mac App；战斗和长时间存读档没测 | [`games/p5r`](games/p5r/README.md) |
+| 荒野大镖客：救赎 | 1.0.4 | Mac；iPhone / iPad App 能编译，没在设备上跑过 | 开发中：能玩到犰狳镇车站，30 帧；玻璃和部分远景画错；还没有 Mac App | [`games/rdr`](games/rdr/README.md) |
+| 巫师 3：狂猎 | 4.04b | Mac | 开发中：第一个引擎内场景，以及读档后在凯尔莫罕游玩，30 帧；还没有 Mac App | [`games/w3`](games/w3/README.md) |
+| 明星三缺一 2013 | v0 | Mac | 早期：标题、菜单和一局对电脑的麻将，30 帧，有 Mac App | [`games/mj2013`](games/mj2013/README.md) |
 
-社区移植的游戏各自在自己的目录里带一份运行时、图形层和脚本，按那里的步骤构建。
+社区移植的游戏各自在自己的目录里带一份运行时、图形层和脚本。
+
+**MNG Launcher** 能打包：王国之泪、旷野之息、时之笛、大金刚 Bananza、宝可梦 Pokopia、密特罗德 生存恐惧、忍者神龟、集合啦！动物森友会、智慧的再现、超级马力欧 奥德赛。Launcher 1.1.3 还能打包御天之剑 HD 和 WORLDEND SYNDROME，之后的版本不再包含。其余游戏按各自目录里的步骤构建。
 
 ### VR：在 Meta Quest 3 里玩王国之泪和旷野之息（6DoF）
 
@@ -304,7 +331,7 @@ Switch 2 游戏在《王国之泪》同一套运行时上运行：它们的 Ampe
 
 ### 推荐的安装
 
-> **交给 AI 助理。** 用 Claude Code、Codex 或其他你喜欢的 AI 助理打开这个仓库，告诉它你自己的游戏文件和 `prod.keys` 在哪，让它帮你打包、安装 App，遇到这台 Mac 上的问题也让它处理。它会按[安装 skill](.claude/skills/install-zelda/SKILL.md) 一步步跑完并检查结果，你只需要喝杯咖啡等着。不推荐自己手动安装测试：步骤多，每台 Mac、每个游戏版本、每份导出的游戏文件都有些差别。这也是我没有提供一键打包的原因：AI 助理就是我的一键打包。红警 2 只需要你自己的 Steam 版游戏（不要 `prod.keys`），按[它自己的 skill](.claude/skills/install-ra2/SKILL.md) 走。
+> **交给 AI 助理。** 用 Claude Code、Codex 或其他你喜欢的 AI 助理打开这个仓库，告诉它你自己的游戏文件和 `prod.keys` 在哪，让它帮你打包、安装 App，遇到这台 Mac 上的问题也让它处理。它会按[安装 skill](.claude/skills/install-zelda/SKILL.md) 一步步跑完并检查结果，你只需要喝杯咖啡等着。不推荐自己手动安装测试：步骤多，每台 Mac、每个游戏版本、每份导出的游戏文件都有些差别。想用窗口操作的话，[MNG Launcher](docs/install.zh-CN.md#mng-launcher窗口) 能打包 VR 一节上方列出的游戏，在 [Releases](https://github.com/ly05010419/MacNativeGames/releases) 下载已签名的 DMG。红警 2 只需要你自己的 Steam 版游戏（不要 `prod.keys`），按[它自己的 skill](.claude/skills/install-ra2/SKILL.md) 走。
 
 ### 安装 skill
 
@@ -317,7 +344,7 @@ Switch 2 游戏在《王国之泪》同一套运行时上运行：它们的 Ampe
 > [!TIP]
 > **公共清单里的每个着色器，开玩之前就已经准备好。** Mac 上不用停下来现场编译，iPhone 和 iPad 上画面也不会缺东西。大家玩过的地方越多，所有人玩得越流畅。
 
-[公共着色器清单](docs/shader-list.md)现在有 **18,290 个着色器变体**（14,727 个着色器），来自 Mac、iPhone 和 iPad：只收打包自己做不出的状态，因为每次打包都会给每个着色器做好默认变体。每次打包都用玩家自己的游戏文件生成，所以清单里只有标识，不含任何游戏数据。参与不需要任何设置：
+[公共着色器清单](docs/shader-list.md)现在有 **18,365 个着色器变体**（14,760 个着色器），来自 Mac、iPhone 和 iPad：只收打包自己做不出的状态，因为每次打包都会给每个着色器做好默认变体。每次打包都用玩家自己的游戏文件生成，所以清单里只有标识，不含任何游戏数据。参与不需要任何设置：
 
 1. **照常玩。** 每次打包都会把游戏里每个着色器按默认绑定状态各备一份。游戏遇到默认那份用不了的状态，或者建了 App 清单里没有的渲染管线，才会记进 `shader-list-contribution.txt`；默认变体不记。
 2. **着色器和管线合计攒够 100 条后，游戏在启动前问你一个问题**，Mac、iPhone、iPad 都一样。选“贡献着色器”，游戏会自己通过 HTTPS 把这些条目发到着色器收件箱（[mac-native-games.com](https://mac-native-games.com)）：启动后不久发一次，之后每半小时一次，不打扰游玩。选“不贡献”就什么都不发。随时可以在“设置”里的开关改。
@@ -327,8 +354,20 @@ Switch 2 游戏在《王国之泪》同一套运行时上运行：它们的 Ampe
 
 **第一次进入游戏或新场景时，新着色器的编译可能造成卡顿，这是预期现象，不必惊讶。** 随着着色器缓存逐步预热，表现通常会改善；[公共清单](#让我们一起维护着色器清单游戏不再卡顿)每多一个着色器，就少一处卡顿。
 
+## 活跃玩家统计
+
+MNG Launcher 和每个游戏**每天最多上报一次**到 [mac-native-games.com](https://mac-native-games.com)，用来统计日活、周活、月活和流失率。上报只有四项：设备的随机安装号（Mac 上是一个文件 `~/Library/Application Support/MacNativeGames/install-id.txt`，Launcher 和所有游戏共用；iPhone / iPad 上是 App 开发者范围内标识的哈希）、程序（Launcher 或哪个游戏）、平台、版本。不保存名字、账号、游戏文件、存档或 IP 地址；网站只存安装号的加盐哈希，120 天后删除。
+
+**默认开启。** 关闭方法：Mac 上打开 **MNG Launcher › 设置…**（⌘,），取消勾选“匿名统计活跃度”，Launcher 和这台 Mac 上的所有游戏都不再上报（它会在 `install-id.txt` 旁边写一个 `usage-stats-off` 文件）；iPhone / iPad 上在系统“设置”App 里这个游戏的页面关闭。
+
 ## 更新说明
 
+- **2026-11-23：大金刚 Bananza 可以用 `.nup` 或导出目录打包，带追加内容（Mac）。** Emerald Rush 能从你自己的文件加载，还没有玩通。
+- **2026-11-23：修复宝可梦 Pokopia 画面偏暗（Mac）。**
+- **2026-11-23：女神异闻录 5 皇家版 1.0.2 和巫师 3 4.04b 登陆 Mac，早期。** 女神异闻录 5 皇家版有 Mac App，能玩到开场赌场（[games/p5r](games/p5r/README.md)）；巫师 3 能读档在凯尔莫罕游玩，还没有 App（[games/w3](games/w3/README.md)）。
+- **2026-11-22：荒野大镖客：救赎 1.0.4 和明星三缺一 2013 登陆 Mac，早期。** 荒野大镖客能玩到犰狳镇车站，还没有 App（[games/rdr](games/rdr/README.md)）；明星三缺一有 Mac App，能打一局麻将（[games/mj2013](games/mj2013/README.md)）。
+- **2026-11-22：灾厄启示录和马力欧卡丁车 8 豪华版有了塞尔达运行时上的重写版，还没有 App**（[games/aocx](games/aocx/README.md)、[games/mk8dx](games/mk8dx/README.md)）。
+- **2026-11-22：修复旷野之息“游戏结束”字样和过场人名卡显示成别的字。**
 - **2026-11-14：WORLDEND SYNDROME 1.0.0 登陆 Mac，实验性。** 用你自己的本体文件打包；从标题玩过 ADV、存档和第一周目循环（[games/worldend](games/worldend/README.md)）。
 - **2026-11-11：排行榜，匿名的帧率榜单（王国之泪、旷野之息、时之笛，Mac）。** 设置面板（按 1）里单独一个标签页显示最新榜单，
   按锁帧和补帧设置分组。**我要上榜**默认关，不弹窗询问；打开后每 5 分钟在本机记一次这局的成绩，开机时和每 30 分钟上传；

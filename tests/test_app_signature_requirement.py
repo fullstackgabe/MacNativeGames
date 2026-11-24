@@ -8,7 +8,7 @@ Tears of the Kingdom, Breath of the Wild and Pokopia, signed by build_app.sign_a
 build_app.sign_app had it since 2026-10-31, but Ocarina of Time's own packaging and the MNG Launcher, written later, signed
 without it and nothing checked them; so the same prompt came back.
 
-Scope (user: "不要 管其他 社区游戏"): build_app.py, update_runtime.py, games/totk, games/oot and tools/, Mac only (iOS apps
+Scope (user: "不要 管其他 社区游戏"): build_app.py, update_runtime.py, games/totk, games/oot, games/tmnt and tools/, Mac only (iOS apps
 are signed by Xcode with a real identity). Every codesign call there that signs must name the bundle ID, or say on its line
 that it signs something inside the app ("# nested: not the app"): a new signing call without either fails here."""
 from pathlib import Path
@@ -16,7 +16,7 @@ import re
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-SCOPE = [ROOT / 'build_app.py', ROOT / 'update_runtime.py', ROOT / 'games/totk', ROOT / 'games/oot', ROOT / 'tools']
+SCOPE = [ROOT / 'build_app.py', ROOT / 'update_runtime.py', ROOT / 'games/totk', ROOT / 'games/oot', ROOT / 'games/tmnt', ROOT / 'tools']
 KINDS = {'.py', '.sh', '.mk', '.command'}
 SIGN = re.compile(r"""codesign\W.*(--sign|\W-s\W)""")
 MARK = '# nested: not the app'
@@ -27,7 +27,7 @@ def sources():
         files = [base] if base.is_file() else sorted(p for p in base.rglob('*') if p.is_file())
         for path in files:
             parts = set(path.relative_to(ROOT).parts)
-            if parts & {'ios', 'tests', 'third_party', '__pycache__', 'build'}:
+            if parts & {'ios', 'ios_launcher', 'tests', 'third_party', '__pycache__', 'build'}:   # ios_launcher: an iPhone app
                 continue
             if path.suffix in KINDS or path.name == 'Makefile':
                 yield path
@@ -55,6 +55,13 @@ class SignedByBundleId(unittest.TestCase):
         self.assertEqual(bad, [], 'sign the app with -r=designated => identifier "<bundle id>" (build_app.sign_app), or mark '
                                   f'a nested bundle "{MARK}":\n' + '\n'.join(bad))
 
+    def test_tmnt_packaging_and_update_name_the_plist_bundle_id(self):
+        for name in ('package_private.py', 'tmnt_update.py'):
+            source = (ROOT / 'games/tmnt/scripts' / name).read_text()
+            self.assertIn('designated => identifier', source)
+            self.assertIn('info["CFBundleIdentifier"]', source)
+        self.assertIn(ROOT / 'games/tmnt', SCOPE)
+
     def test_build_app_sign_app_names_the_bundle_id(self):
         source = (ROOT / 'build_app.py').read_text()
         body = source[source.index('def sign_app('):]
@@ -65,9 +72,8 @@ class SignedByBundleId(unittest.TestCase):
         source = (ROOT / 'games/oot/build.py').read_text()
         self.assertIn("build_app.sign_app(temporary,work/'logs')", source)
 
-    def test_the_launcher_names_its_bundle_id(self):
-        source = (ROOT / 'tools/builder_app/make_app.py').read_text()
-        self.assertIn('designated => identifier "{BUNDLE_ID}"', source)
+    # the Launcher's make_app.py names its bundle ID too: checked in MNG-Launcher, its own repository since 2026-11-20
+    # (tests/test_porting_contract.py)
 
     def test_the_check_catches_a_plain_ad_hoc_signature(self):
         line = "    subprocess.run(['codesign','--force','--sign','-',temporary],check=True)"

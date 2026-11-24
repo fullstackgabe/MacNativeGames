@@ -310,14 +310,48 @@ def _bfttf_valid(path):
 
 
 # ---- prerequisites ----
+def sdk_major(version):
+    """26 for '26.0' (xcrun --show-sdk-version); 0 when it says nothing readable."""
+    head = version.split('.')[0]
+    return int(head) if head.isdigit() else 0
+
+
 def prerequisites(args):
     if platform.system() != 'Darwin' or platform.machine() != 'arm64':
         raise BuildError('needs a Mac with Apple silicon')
     major = int(platform.mac_ver()[0].split('.')[0] or 0)
     if major < 26:
         raise BuildError(f'needs macOS 26 or later (Metal 4); this is macOS {platform.mac_ver()[0]}')
+    if compile_free(args):
+        say('   this source has the release\'s prebuilt programs (tools/prebuilt.py): no developer tools needed')
+    else:
+        developer_tools(args)
+    py = next((p for p in (shutil.which(n, path=os.pathsep.join(TOOL_PATHS)) for n in ('python3.14', 'python3.15')) if p), None)
+    if not py:
+        raise BuildError('Python 3.14 not found (the build reads zstd with the standard library): install it from '
+                         'https://www.python.org/downloads/macos/ (or brew install python@3.14)')
+    return Path(py)
+
+
+def compile_free(args):
+    """A Mac build of this source compiles nothing (tools/prebuilt.py: every program is the release's): it needs no
+    command line tools, and none of their programs (xcrun, git, make) is run, since on a Mac without them each asks to
+    install them."""
+    return getattr(args, 'platform', 'macos') == 'macos' and prebuilt.complete(REPO)
+
+
+def developer_tools(args):
+    """The command line tools a build that compiles needs, and the codec libraries it links."""
     if subprocess.run(['xcrun', '--find', 'clang'], capture_output=True).returncode:
         raise BuildError('the Xcode command line tools are missing: xcode-select --install')
+    # Metal 4 and MetalFX frame interpolation come with the macOS 26 SDK: an older Xcode on macOS 26 passes the checks
+    # here and the build stops minutes later at "cannot find protocol declaration for 'MTL4CommandBuffer'" (#2250)
+    sdk = subprocess.run(['xcrun', '--show-sdk-version'], capture_output=True, text=True).stdout.strip()
+    if sdk_major(sdk) < 26:
+        raise BuildError(f'the developer tools use the macOS {sdk or "?"} SDK, which has no Metal 4; the build needs the macOS 26 '
+                         'SDK or later. Update Xcode from the App Store, or use the command line tools: sudo xcode-select -s '
+                         '/Library/Developer/CommandLineTools (if they are old too: sudo rm -rf /Library/Developer/CommandLineTools '
+                         '&& xcode-select --install). xcode-select -p and xcrun --show-sdk-version show what is used')
     # SPIRV-Cross is C++: without the SDK's libc++ headers the build stops much later at "'string' file not found" (#41)
     cxx = subprocess.run(['xcrun', 'clang++', '-std=c++11', '-x', 'c++', '-fsyntax-only', '-'], input='#include <string>\n',
                          capture_output=True, text=True)
@@ -328,14 +362,9 @@ def prerequisites(args):
                          f'(xcode-select -p and xcrun --show-sdk-path show what is used). clang++ said: {cxx.stderr.strip()[:300]}')
     if not shutil.which('git', path=os.pathsep.join(TOOL_PATHS + ['/usr/bin'])):
         raise BuildError('git not found: xcode-select --install')
-    py = next((p for p in (shutil.which(n, path=os.pathsep.join(TOOL_PATHS)) for n in ('python3.14', 'python3.15')) if p), None)
-    if not py:
-        raise BuildError('Python 3.14 not found (the build reads zstd with the standard library): install it from '
-                         'https://www.python.org/downloads/macos/ (or brew install python@3.14)')
     # update_runtime.py passes its own arguments, which have no --platform: a Mac update (fa394da8 read args.platform and
     # every express update of Tears of the Kingdom and Breath of the Wild stopped with AttributeError)
     codec_libraries(getattr(args, 'platform', 'macos'))
-    return Path(py)
 
 
 # The runtime links opus (the games' audio), libvpx (VP8 / VP9 videos) and, for Ocarina of Time, dav1d statically. The
@@ -343,6 +372,7 @@ def prerequisites(args):
 # game, so a build needs no Homebrew (user 2026-11-12: "玩家完全不用装 Homebrew", "全部 24 款，用共用的 tools/deps").
 sys.path.insert(0, str(REPO))
 import tools.deps as deps  # noqa: E402
+import tools.prebuilt as prebuilt  # noqa: E402   the release's programs of this source: no compiler needed for them
 
 
 def codec_libraries(target='macos'):
@@ -420,6 +450,36 @@ def say_left_game_files(copy):
             'and reads the game files from where you pass them, so these copies can be deleted (unless you pass them from there).')
 
 
+def outside_links(folder):
+    """The files in folder (relative paths) that are links to a file outside it, as the checkout's shared/ (b7048211)."""
+    inside, found = folder.resolve(), []
+    for root, dirs, files in os.walk(folder):
+        if Path(root) == folder:
+            dirs[:] = [d for d in dirs if d not in WORK_COPY_SKIP]   # the build's own output, never copied
+        for name in files:
+            path = Path(root) / name
+            if path.is_symlink() and path.is_file() and not path.resolve().is_relative_to(inside):
+                found.append(path.relative_to(folder))
+    return found
+
+
+def sync_folder(source, copy, excludes, log):
+    """copy mirrors source (prepare_work). A link out of source arrives as the file it names: from the work folder its
+    relative path points beside it (#2270, 19 links into shared/ dangled and every build and express update stopped
+    at the runtime's make). rsync leaves those paths alone, as macOS's rsync (openrsync) cannot follow a link while it
+    compares by --checksum ("Too many levels of symbolic links", for --copy-unsafe-links and -L alike); they are
+    written here by the same rule: a changed file gets the time of this copy, an unchanged one keeps its own."""
+    links = outside_links(source)
+    run(['rsync', '-rlpD', '--checksum', '--delete', *excludes, *(f'--exclude=/{rel}' for rel in links),
+         f'{source}/', f'{copy}/'], log)
+    for rel in links:
+        data, out = (source / rel).read_bytes(), copy / rel
+        if out.is_symlink() or not out.is_file() or out.read_bytes() != data:
+            out.unlink(missing_ok=True)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(data)
+
+
 def prepare_work(work, py, logs):
     """work/totk: the game folder of this repository with the generated files inside it (the build scripts write
     extracted/, rewritten/, build/ and analysis/ next to themselves); its tooling/ points at the fetched sources."""
@@ -437,15 +497,14 @@ def prepare_work(work, py, logs):
     # that built here before) was compiled by the Makefile's wildcards with this checkout's headers (2026-11-13: an express
     # update from main stopped on a branch's nvn_pool_sources.m). The excluded folders (WORK_COPY_SKIP: the build's own
     # output) and game files are never deleted: rsync leaves excluded paths alone.
-    sync = ['rsync', '-rlpD', '--checksum', '--delete', *excludes]
-    run([*sync, f'{GAME}/', f'{tree}/'], logs / 'sources.log')
+    sync_folder(GAME, tree, excludes, logs / 'sources.log')
     # zeldaVR's modules (games/totk/zeldaVR links to them in the repository): into the tree, where the Makefile and the
     # iOS project take them; VR stays off unless TOTK_VR_CONTROL is set
-    run([*sync, f'{REPO / "zeldaVR"}/', f'{tree / "zeldaVR"}/'], logs / 'sources-zeldavr.log')
+    sync_folder(REPO / 'zeldaVR', tree / 'zeldaVR', excludes, logs / 'sources-zeldavr.log')
     # games/botw: its scripts find the shared ones at ../totk/scripts (work/botw next to work/totk)
-    run([*sync, f'{BOTW}/', f'{work / "botw"}/'], logs / 'sources-botw.log')
+    sync_folder(BOTW, work / 'botw', excludes, logs / 'sources-botw.log')
     for g in NS2.values():   # the Switch 2 games' expected values and shared lists (games/totk/Makefile: ../pokopia/assets/...)
-        run([*sync, f'{g["folder"]}/', f'{work / g["folder"].name}/'], logs / f'sources-{g["folder"].name}.log')
+        sync_folder(g['folder'], work / g['folder'].name, excludes, logs / f'sources-{g["folder"].name}.log')
     for copy in (tree, work / 'botw', *(work / g['folder'].name for g in NS2.values())):
         say_left_game_files(copy)
     tooling = tree / 'tooling'
@@ -454,10 +513,8 @@ def prepare_work(work, py, logs):
     if tooling.is_symlink():
         tooling.unlink()
     tooling.mkdir(exist_ok=True)
-    src = work / 'src'
-    say('fetching the pinned SPIRV-Cross sources')
-    git_fetch(*SPIRV_CROSS, src / 'SPIRV-Cross', logs / 'fetch-spirv-cross.log')
-    link(tooling / 'spirv-cross', src / 'SPIRV-Cross')
+    if prebuilt.program(REPO, 'spirv-cross') is None:   # the release's program needs no sources (tools/prebuilt.py)
+        spirv_cross_sources(tree, logs)
     venv = work / 'venv'
     if not (venv / 'bin/python').exists():
         say('Python environment for the build tools')
@@ -991,7 +1048,7 @@ def step_data(tree, game, keys, logs, *, firmware=None, shared_fonts=None, mod=N
         if romfs.exists():
             shutil.rmtree(romfs)
         run([py, 'scripts/extract_romfs.py', '--keys', keys], logs / 'extract_romfs.log', cwd=tree)
-        r = json.loads(index.read_text())
+        r = json.loads((romfs / 'index.json').read_text())
         check('RomFS', r['romfs_sha256'], EXPECTED['romfs']['sha256'])
     fonts = tree / 'extracted/firmware/shared-fonts'
     if not fonts_valid(fonts):
@@ -1024,6 +1081,10 @@ def step_data(tree, game, keys, logs, *, firmware=None, shared_fonts=None, mod=N
 
 
 def build_hactool(tree, logs):
+    placed = tree.parent / 'src/hactool-prebuilt/hactool'
+    if prebuilt.place(REPO, 'hactool', placed):   # the release's, from the same pinned commit and hooks (tools/prebuilt.py)
+        return placed
+    prebuilt.compiler_needed('hactool')
     source = tree.parent / 'src/hactool'
     git_fetch(*HACTOOL, source, logs/'fetch-hactool.log')
     # Add an explicit private title-key file, so base NSP and update tickets do not
@@ -1225,8 +1286,24 @@ def step_update_data(tree, game, update, keys, logs, *, version, mod=None, nativ
             logs/(version+'-'+script+(f'-{i}' if i > 1 else '')+'.log'), cwd=tree)
 
 
+def spirv_cross_sources(tree, logs):
+    """The pinned SPIRV-Cross sources at tree/tooling/spirv-cross (git; for compiling the program, or an iPhone / iPad
+    build's in-app translator)."""
+    if (tree / 'tooling/spirv-cross').exists():
+        return
+    (tree / 'tooling').mkdir(exist_ok=True)
+    say('fetching the pinned SPIRV-Cross sources')
+    git_fetch(*SPIRV_CROSS, tree.parent / 'src/SPIRV-Cross', logs / 'fetch-spirv-cross.log')
+    link(tree / 'tooling/spirv-cross', tree.parent / 'src/SPIRV-Cross')
+
+
 def build_spirv_cross(tree, logs):
-    """The spirv-cross program with clang (the sources and flags of SPIRV-Cross's CMake Release build of it)."""
+    """The spirv-cross program with clang (the sources and flags of SPIRV-Cross's CMake Release build of it), or the
+    release's prebuilt one of this source (tools/prebuilt.py)."""
+    if prebuilt.place(REPO, 'spirv-cross', tree / 'build/spirv-cross/spirv-cross'):
+        return
+    prebuilt.compiler_needed('SPIRV-Cross')
+    spirv_cross_sources(tree, logs)
     src, out = tree / 'tooling/spirv-cross', tree / 'build/spirv-cross'
     objs = out / 'obj'
     objs.mkdir(parents=True, exist_ok=True)
@@ -1253,6 +1330,7 @@ def build_device_translator(tree, logs):
         if not lib.is_file() or sha256(lib) != want:
             raise BuildError(f'{lib}: not the file this repository ships (its SHA-256 differs from {lib.name}.sha256); '
                              f'check it out again, or rebuild both with games/totk/tools/totk_xlate/publish_ios_lib.sh')
+    spirv_cross_sources(tree, logs)
     src, out = tree / 'tooling/spirv-cross', tree / 'build/ios-xlate'
     objs = out / 'obj'
     objs.mkdir(parents=True, exist_ok=True)
@@ -1380,15 +1458,41 @@ def variant_sources(game):
     return [p for p in found if len(p.stem) == 64 and sha256(p) == p.stem]
 
 
-def step_shader_libs(tree, logs, *, version='v0'):
+NO_METAL_COMPILER = ('no Metal shader compiler was found: it comes with an Xcode\'s Metal toolchain (Xcode > Settings > '
+                     'Components > Metal Toolchain, or xcodebuild -downloadComponent MetalToolchain), not with the command '
+                     'line tools xcode-select may point at; with an Xcode elsewhere, run with '
+                     'DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer (its path)')
+
+
+REFUSED_LIBS = 'refused.json'   # build/shader-libs/: the digests the compiler of compiler.txt did not compile
+
+
+def refused_shader_libs(tree, compiler):
+    """The startup shaders (by their source's SHA-256) the Metal compiler `compiler` (metal_compiler()'s second item)
+    refused in the work folder's last step_shader_libs; empty when another compiler made those libraries or none did."""
+    libs = tree/'build/shader-libs'
+    try:
+        if (libs/'compiler.txt').read_text() != ' '.join([compiler, *METAL_FLAGS]):
+            return frozenset()
+        return frozenset(json.loads((libs/REFUSED_LIBS).read_text()))
+    except (OSError, ValueError, TypeError):
+        return frozenset()
+
+
+def step_shader_libs(tree, logs, *, version='v0', required=False):
     """Compile the startup shaders ahead of time. Metal's own cache of shaders compiled at launch does not follow the
     app to a folder whose path has another length (step_warm_metal); these files go inside the app. Each is named by the
-    SHA-256 of its source, so the game loads only an exact match, and a rebuild reuses every shader that did not change."""
+    SHA-256 of its source, so the game loads only an exact match, and a rebuild reuses every shader that did not change.
+    required: no compiler is an error (update_runtime.py --seed / --shader-libs), not a skip. A new seed without its
+    libraries leaves the game compiling its shaders from source at every cold start: an app updated that way had
+    libraries for 1,890 of the 17,884 shaders its warm-up loads (2026-11-18)."""
     sources = sorted((tree/f'build/shader-seed/{version}').glob('*.metal'))
     found = metal_compiler()
     if not found:
-        say('3/4 shaders: no Metal toolchain (xcodebuild -downloadComponent MetalToolchain), so the startup shaders go '
-            "into Metal's cache for the app's location at the end of the build instead; moving the app makes them cold again")
+        if required:
+            raise BuildError(f'{NO_METAL_COMPILER}; the app was not changed')
+        say('3/4 shaders: WARNING: no Metal toolchain (xcodebuild -downloadComponent MetalToolchain), so the startup shaders '
+            "go into Metal's cache for the app's location at the end of the build instead; moving the app makes them cold again")
         return
     metal, compiler, metal_env = found
     libs = tree/'build/shader-libs'
@@ -1417,10 +1521,14 @@ def step_shader_libs(tree, logs, *, version='v0'):
         r = subprocess.run([metal, *flags, '-o', partial, src], capture_output=True, text=True, env=metal_env)
         if r.returncode:
             partial.unlink(missing_ok=True)
-            return f'{src.name}\n{r.stdout}{r.stderr}'
+            return digest, f'{src.name}\n{r.stdout}{r.stderr}'
         partial.replace(libs/f'{digest}.metallib')
     with concurrent.futures.ThreadPoolExecutor(os.cpu_count() or 4) as pool:
-        failed = [f for f in pool.map(compile_one, todo.items()) if f]
+        refused = [f for f in pool.map(compile_one, todo.items()) if f]
+    failed = [text for _, text in refused]
+    # the sources this compiler (compiler.txt) refused: update_runtime.py does not count them as libraries to complete,
+    # so one shader the compiler cannot take does not send every later express update through the completion
+    (libs/REFUSED_LIBS).write_text(json.dumps(sorted(digest for digest, _ in refused)))
     log = logs/'shader-libs.log'
     log.parent.mkdir(parents=True, exist_ok=True)
     log.write_text('\n'.join(failed))
@@ -1437,14 +1545,52 @@ def build_launcher(tree, version, logs, env):
 
 
 def build_warm_tool(tree, logs, env):
-    """build/warm-metal-cache: used only while packaging (step_warm_metal); not part of the app."""
+    """build/warm-metal-cache: used only while packaging (step_warm_metal); not part of the app. The release's prebuilt
+    one of this source when there is one (tools/prebuilt.py)."""
+    if prebuilt.place(REPO, 'warm-metal-cache', tree / 'build/warm-metal-cache'):
+        return
+    prebuilt.compiler_needed('the warm-up tool')
     run(['xcrun', 'clang', '-fobjc-arc', '-O2', '-Wall', '-Wextra', 'tools/warm_metal_cache.m', '-framework', 'Metal',
          '-framework', 'Foundation', '-o', 'build/warm-metal-cache'], logs / 'warm-metal-cache-build.log', cwd=tree, env=env)
 
 
+# games/totk/Makefile's SHADER_LIST ?= of each version (the list its pso_manifest.tsv / pso_title.tsv come from)
+SHADER_LISTS = {'botw160': '../botw/assets/shader_list.tsv', 'botw190': '../botw/assets/shader_list.tsv',
+                'dkb': '../dkb/assets/shader_list.tsv', 'pkp': '../pokopia/assets/shader_list.tsv'}
+
+
+def make_game_data(tree, version, logs, env):
+    """make game-data-<version> (games/totk/Makefile GAME_DATA, and Breath of the Wild's aoc-config.txt rule): its Python
+    steps, so no make is needed (tests/test_prebuilt.py checks them against the Makefile for every version)."""
+    py = tree / '.venv/bin/python'
+    steps = [('prepare_runtime.py',), ('prepare_romfs_backend.py',), ('prepare_shared_fonts.py',)]
+    if 'aoc-config.txt' in game_data_files(version) + game_data_optional(version):   # the add-on content volumes, none given or not
+        steps.append(('prepare_romfs_backend.py', '--aoc'))
+    for script, *extra in steps:
+        log = logs / f'game-data-{script[:-3]}{"".join(extra).replace("--", "-")}.log'
+        run([py, f'scripts/{script}', '--version', version, *extra], log, cwd=tree, env=env)
+
+
+def make_runtime(tree, version, logs, env, *, data=True):
+    """make runtime-<version> (data) or binary-<version>: the game binary and its pso lists (and the game data folder).
+    The binary is the release's prebuilt one of this source when there is one (tools/prebuilt.py: a player needs no
+    command line tools); the rest are Python steps, run here without make then."""
+    name = prebuilt.runtime_name(version)
+    if not prebuilt.place(REPO, name, tree / 'build' / name):
+        prebuilt.compiler_needed(f'the {version} runtime')
+        target = ('runtime' if data else 'binary') + ('' if version == 'v0' else f'-{version}')
+        run(['make', f'-j{os.cpu_count() or 4}', target], logs / 'runtime.log', cwd=tree, env=env)
+        return
+    shader_list = (env or {}).get('SHADER_LIST') or SHADER_LISTS.get(version, 'assets/shader_list.tsv')
+    run([tree / '.venv/bin/python', 'scripts/shader_list.py', 'export', shader_list, 'build/pso_manifest.tsv',
+         'build/pso_title.tsv'], logs / 'pso-lists.log', cwd=tree, env=env)
+    if data:
+        make_game_data(tree, version, logs, env)
+
+
 def step_binary(tree, game, keys, env, logs, *, version="v0", title='0100f2c0115b6000'):
     say('4/4 app: building the game binary (the launcher, app/launcher.m, is part of it)')
-    run(['make', f'-j{os.cpu_count() or 4}', 'runtime' if version == 'v0' else f'runtime-{version}'], logs / 'runtime.log', cwd=tree, env=env)
+    make_runtime(tree, version, logs, env)
     build_warm_tool(tree, logs, env)
     if game is not None and not (tree / 'build/AppIcon.icns').exists():   # the game's own icon from its control data; optional (none from a dump folder yet)
         try:
@@ -1616,6 +1762,12 @@ def game_data_files(version):
         (('process.txt',) if ns2_game(version) else ())   # GAME_NS2 reads the NPDM's system resource size (runtime/services.c)
 
 
+def game_data_optional(version):
+    """Game data files an app may lack: Bananza's add-on configuration, which an app packed before 2026-11-23 does not have
+    (runtime/aoc_romfs.c then lists no add-on), so its express update still needs no full rebuild."""
+    return ('aoc-config.txt',) if version == 'dkb' else ()
+
+
 def place_game_data(tree, res, version):
     """build/game-data/<version>: what the runtime reads from the player's files at start instead of having it compiled in
     (module tables, RomFS / add-on content / font sizes and hashes; games/totk/runtime/game_data.h), at the same place in
@@ -1624,18 +1776,35 @@ def place_game_data(tree, res, version):
     missing = [name for name in game_data_files(version) if not (data / name).is_file()]
     if missing:
         raise BuildError(f'{data}: {", ".join(missing)} missing (games/totk/Makefile game-data-{version})')
-    for name in game_data_files(version):
+    for name in game_data_files(version) + tuple(n for n in game_data_optional(version) if (data / n).is_file()):
         clone(data / name, dst / name)
 
 
-def resolve_lists(tree, res, game, logs):
+def resolve_lists(tree, res, game, logs, shared=None):
     """The warm-up lists of the app (build/pso_manifest.tsv, pso_title.tsv): the shared shader list's rows of this game
-    version, each variant named as the app's seed serves its bind state (shader_list.py resolve)."""
+    version, each variant named as the app's seed serves its bind state (shader_list.py resolve). shared: another list
+    than the work folder's copy (update_runtime.py: the newest from GitHub)."""
     ns2 = ns2_game(game)
-    shared = (tree.parent / 'botw/assets/shader_list.tsv' if game == 'botw' else
-              tree.parent / ns2['folder'].name / 'assets/shader_list.tsv' if ns2 else tree / 'assets/shader_list.tsv')
+    shared = shared or (tree.parent / 'botw/assets/shader_list.tsv' if game == 'botw' else
+                        tree.parent / ns2['folder'].name / 'assets/shader_list.tsv' if ns2 else tree / 'assets/shader_list.tsv')
     run([tree/'.venv/bin/python', 'scripts/shader_list.py', 'resolve', res/'build/shader-seed', shared,
          res/'build/pso_manifest.tsv', res/'build/pso_title.tsv'], logs/'shader-list-resolve.log', cwd=tree)
+
+
+def romfs_runtime_index(tree, version, logs):
+    """extracted/<version>/romfs/runtime-index.bin, the runtime's index of the image, made from its index.json by
+    scripts/prepare_romfs_backend.py as make game-data makes it: again when it is missing or older than index.json. True
+    when the folder then holds romfs.bin, index.json and that index. #2303: an image an express update took from the app
+    (adopt_game_data, which writes romfs.bin and index.json) had no index, and prepare_prompt_hud.py stopped on it."""
+    folder = tree / f'extracted/{version}/romfs'
+    image, listing, index = folder / 'romfs.bin', folder / 'index.json', folder / 'runtime-index.bin'
+    if not image.is_file() or not listing.is_file():
+        return False
+    if not index.is_file() or index.stat().st_mtime_ns < listing.stat().st_mtime_ns:
+        say(f'   the work folder\'s {version} game data has no runtime index of its own yet: made from its index.json')
+        run([tree / '.venv/bin/python', 'scripts/prepare_romfs_backend.py', '--version', version],
+            logs / f'romfs-index-{version}.log', cwd=tree)
+    return index.is_file()
 
 
 def prepare_prompt_assets(tree, app, version, logs, *, prompt_app=None):
@@ -1644,18 +1813,19 @@ def prepare_prompt_assets(tree, app, version, logs, *, prompt_app=None):
     if version == 'v143':
         # A fresh app has not received its GameData bundle yet. Runtime updates
         # can instead read the installed app when no extraction cache is kept.
+        # The work folder's image is read only with its runtime index (#2303).
         romfs = tree / f'extracted/{version}/romfs'
-        source = ['--romfs', romfs] if (romfs / 'romfs.bin').is_file() else ['--app', prompt_app or app]
+        source = ['--romfs', romfs] if romfs_runtime_index(tree, version, logs) else ['--app', prompt_app or app]
         run([tree / '.venv/bin/python', tree / 'scripts/prepare_prompt_hud.py', *source,   # Python 3.14: compression.zstd (#2099)
              '--version', version, '--output', res / 'build/prompt-hud.tsv'], logs / 'prompt-hud.log')
 
 
-def place_runtime(tree, app, version, logs, *, game='totk', lists=True, prompt_app=None):
+def place_runtime(tree, app, version, logs, *, game='totk', lists=True, prompt_app=None, shared=None):
     """The parts of the app made from this repository alone, which update_runtime.py replaces in an installed app: the
     game binary, the launcher, the shader tools and the warm-up lists exported from the shared shader list. Everything
     else in the app comes from the player's game files (place_game_data, the rewritten modules, the RomFS, the seed).
     lists=False keeps the app's warm-up lists (update_runtime.py, when the app's seed predates its shader-keys.json);
-    else resolve_lists makes them anew."""
+    else resolve_lists makes them anew, from shared when given (update_runtime.py: the newest list)."""
     res = app / 'Contents/Resources/totk'   # the launcher's game folder, for both games (app/launcher.m)
     # The FXAA reference requires its notice in binary distributions; runtime updates use this same packaging path.
     for name in ('fxaa', 'smaa'):
@@ -1667,7 +1837,7 @@ def place_runtime(tree, app, version, logs, *, game='totk', lists=True, prompt_a
     clone(tree / 'prebuilt/macos-arm64/totk_xlate', res / 'build/shader-service/totk_xlate')   # where totk_shader_rt.m looks for it
     prepare_prompt_assets(tree, app, version, logs, prompt_app=prompt_app)
     if lists:
-        resolve_lists(tree, res, game, logs)
+        resolve_lists(tree, res, game, logs, shared=shared)
     clone(res / 'build/totk-native', app / f'Contents/MacOS/{APPS[game][2]}')
 
 
@@ -1992,7 +2162,7 @@ def pipeline_files_stamp(folder):
     h = hashlib.sha256()
     for p in sorted(p for p in Path(folder).iterdir() if p.is_file() and p.name.startswith('pipelines-')):
         st = p.stat()
-        h.update(f'{p.name} {st.st_size} {st.st_mtime_ns if p.suffix == ".metalarchive" else sha256(p)}\n'.encode())
+        h.update(f'{p.name} {st.st_size} {st.st_mtime_ns if p.suffix in (".metalarchive", ".mtl4a") else sha256(p)}\n'.encode())
     return h.hexdigest()
 
 
@@ -2265,6 +2435,47 @@ def source_commit():
     return result.stdout.strip() if result.returncode == 0 else ''
 
 
+LAUNCHER_BUNDLE_ID = 'org.macnativegames.launcher'
+
+
+def launcher_app():
+    """The MNG Launcher that runs this build, or None: the app bundled_job.py names (MNG_LAUNCHER_APP), else the one
+    whose bundled Python runs this script (an express update started from a terminal with the Python an app recorded)."""
+    named = os.environ.get('MNG_LAUNCHER_APP')
+    candidates = [Path(named)] if named else []
+    for python in (Path(sys.executable).absolute(), Path(sys.executable).resolve()):   # a virtual environment's links to it
+        candidates += [folder for folder in python.parents if folder.suffix == '.app']
+    for app in candidates:
+        try:
+            info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
+        except (OSError, plistlib.InvalidFileException, ValueError):
+            continue
+        if info.get('CFBundleIdentifier') == LAUNCHER_BUNDLE_ID:
+            return info
+    return None
+
+
+def launcher_version():
+    """For the HUD's build line (user 2026-11-18: "版本号 旁边 显示 launcher的版本号（launcher版本号放第一）"): the version of
+    the released MNG Launcher that runs this build (it carries its source archive, as the Launcher's own isRelease).
+    'dev' for a development build: a Launcher made from a checkout runs it (its version string is a placeholder, and the
+    Launcher's own label says 开发版 there), or it is run from a git checkout without a Launcher. '' otherwise."""
+    info = launcher_app()
+    if info is not None and isinstance(info.get('MNGSourceArchiveSHA256'), str):
+        return str(info.get('CFBundleShortVersionString') or '')
+    return 'dev' if info is not None or (REPO / '.git').exists() else ''
+
+
+def record_launcher_version(info):
+    """MNGLauncherVersion in an app's Info.plist (app/launcher.m -> TOTK_LAUNCHER_VERSION, shared/runtime/hud_box.h):
+    the Launcher of this build, not of an earlier one."""
+    version = launcher_version()
+    if version:
+        info['MNGLauncherVersion'] = version
+    else:
+        info.pop('MNGLauncherVersion', None)
+
+
 def write_main_build_id(nso, target):
     if not nso.is_file():
         return
@@ -2334,6 +2545,7 @@ def step_app(tree, out, logs, *, version="v0", game='totk', game_data='app', gam
     commit = source_commit()
     if commit:
         info['MNGSourceCommit'] = commit   # app/launcher.m -> TOTK_SOURCE_COMMIT: the HUD box shows which commit the app is
+    record_launcher_version(info)          # and, before it, the Launcher that built it
     record_update_source(info, tree.parent)
     if version in ('v143', 'botw160', 'botw190') and native_5k is not None:
         info['MNGNative5K'] = native_5k   # explicit on/off survives runtime updates; absent means automatic
@@ -2363,21 +2575,26 @@ def mac_pipeline_files(made, seed, arch, chain):
     # (par_stale) stays listed in its old file, which keeps its other keys; until 2026-11-15 the index listed such a key
     # twice, the old file first by name, and the game takes a key's first row (par_load_prebuilt): it used the stale
     # pipeline, which Metal refused (14 of a quick App's 124 mesh pipelines compiled again at every start).
-    batches = sorted((p.with_suffix('.keys') for p in made.glob('*.metalarchive') if p.with_suffix('.keys').is_file()),
-                     key=lambda k: (k.stat().st_mtime, k.stem))
+    # Ocarina of Time on the Mac also writes Metal 4 files (nvn_pso4.h: <made>/../pipelines-mtl4/<name>.mtl4a + .keys, GPU
+    # code only, up to 2,000 pipelines a file): named m4-<name> in the App (pipelines-<arch>-m4-<name>.mtl4a), which tells
+    # the runtime which API opens them. A key in both kinds goes to the newer file, as between two old files.
+    def kind(folder, ext, prefix):
+        return [(k, ext, prefix + k.stem) for k in (p.with_suffix('.keys') for p in folder.glob(f'*.{ext}')) if k.is_file()]
+    batches = sorted(kind(made, 'metalarchive', '') + kind(made.parent / 'pipelines-mtl4', 'mtl4a', 'm4-'),
+                     key=lambda b: (b[0].stat().st_mtime, b[2]))
     owner = {}
-    for keys in batches:
+    for keys, _, name in batches:
         for key in keys.read_text().split('\n'):
             if key:
-                owner[key] = keys.stem
+                owner[key] = name
     index = []
-    for keys in batches:
-        mine = [key for key in keys.read_text().split('\n') if key and owner.get(key) == keys.stem]
+    for keys, ext, name in batches:
+        mine = [key for key in keys.read_text().split('\n') if key and owner.get(key) == name]
         if not mine:
             continue   # every key it lists was written again later: the App does not carry it
         mine = list(dict.fromkeys(mine))
-        clone(keys.with_suffix('.metalarchive'), seed / f'pipelines-{arch}-{keys.stem}.metalarchive')
-        index += [f'{key}\t{keys.stem}' for key in mine]
+        clone(keys.with_suffix('.' + ext), seed / f'pipelines-{arch}-{name}.{ext}')
+        index += [f'{key}\t{name}' for key in mine]
     if not index:
         return 0
     # #2070: the compute shaders this GPU's Metal compiler built only with their float adds lowered (nvn_float_rmw.h): the
@@ -2413,7 +2630,11 @@ def mac_pipelines(tree, res, version, logs, installed=None):
         say('4/4 app: no warm-up lists or no seed, so the first start fills the pipeline archive itself')
         return
     work = tree / f'build/mac-pipelines/{version}'
-    want = hashlib.sha256(b''.join(p.read_bytes() for p in [manifest, *lists, build / 'totk-native'])).hexdigest()
+    # The compiled libraries the tool loads (shader-libs, named by their source's SHA-256) are inputs too: pipelines made
+    # while a shader was compiled from source may not match the function its offline library holds (a wrong file is a
+    # miss, totk_pipeline_archive.h), so a new library set checks the archive against them (TOTK_PAR_RECHECK).
+    libs = ''.join(f'{p.name}\n' for p in sorted((build / 'shader-libs').glob('*.metallib'))).encode()
+    want = hashlib.sha256(b''.join(p.read_bytes() for p in [manifest, *lists, build / 'totk-native']) + libs).hexdigest()
     stamp = work / 'inputs.txt'
     was = stamp.read_text().split() if stamp.is_file() else []
     kept = was == [want]
@@ -2578,6 +2799,69 @@ def ns2_dump_exefs(dump, update=None):
     return (found[-1] if found else dump / 'base') / 'exefs'
 
 
+def ns2_source_title(source):
+    """The application a Switch 2 source holds: a .nup's package table, a dump folder's NPDM; None when it has neither."""
+    if source.is_file():
+        from tools import nup_title
+        return nup_title.read(source)[0]
+    exefs = ns2_dump_exefs(source)
+    return npdm_program_id(exefs / 'main.npdm') if (exefs / 'main.npdm').is_file() else None
+
+
+def ns2_source_args(source):
+    """What import_dump.py needs for this source: the .nup reader, which the work folder (a copy of games/totk) does not hold."""
+    return ['--nup-lib', REPO / 'games/oot/third_party/nup'] if source.is_file() else []
+
+
+def step_aoc_ns2(tree, source, g, logs):
+    """The add-on content of a Switch 2 game, from its .nup or its dump folder's dlc/, into extracted/<version>/aoc/<index>
+    for runtime/aoc_romfs.c. A pack goes in only when it is the one this version pins; any other leaves the build going
+    without it, as a dump folder's dlc/ was ignored before 2026-11-23. A pack the source no longer holds is removed."""
+    v = g['version']
+    pins = VERSIONS[v].get('aoc') or {}
+    if not pins:
+        return
+    py, aoc = tree / '.venv/bin/python', tree / f'extracted/{v}/aoc'
+    title = next(t for t, x in NS2.items() if x['version'] == v)
+    source_args = [*ns2_source_args(source), '--title', title]
+    log = logs / f'addons-{v}.log'
+    run([py, 'scripts/import_dump.py', source, '--list-addons', *source_args], log, cwd=tree)
+    held = (last_json(log) or {}).get('addons', {})
+    staging, keep = aoc.with_name('aoc-import'), set()
+    for index, pack in sorted(held.items()):
+        pin = pins.get(index)
+        if pin is None or pack['title_id'] != pin['title_id']:
+            say(f'2/4 data: add-on content {pack["title_id"]} is not a pack of this version: left out')
+        elif dlc_pack_valid(aoc / index, pin):
+            keep.add(index)
+        elif ns2_import_addon(py, tree, source, source_args, index, pin, aoc, staging, logs / f'addon-{v}-{index}.log'):
+            keep.add(index)
+    stale = [p for p in aoc.iterdir() if p.name not in keep] if aoc.is_dir() else []
+    for p in stale:
+        shutil.rmtree(p) if p.is_dir() else p.unlink()
+    if stale:   # the Makefile only sees packs that appear, so the old mask goes with the pack
+        (tree / 'build/game-data' / v / 'aoc-config.txt').unlink(missing_ok=True)
+
+
+def ns2_import_addon(py, tree, source, source_args, index, pin, aoc, staging, log):
+    """One add-on pack through staging into aoc/<index>; False (and said) when it is not the pinned one."""
+    say(f'2/4 data: importing the add-on content {pin["title_id"]} ({pin["size"] / 2**30:.1f} GB)')
+    shutil.rmtree(staging, ignore_errors=True)
+    try:
+        run([py, 'scripts/import_dump.py', source, '--addons', staging, '--only', index, *source_args], log, cwd=tree)
+        report = json.loads((staging / index / 'index.json').read_text())
+        if report['romfs_sha256'] != pin['sha256'] or report['romfs_size'] != pin['size']:
+            say(f'2/4 data: add-on content {pin["title_id"]} is not the verified one '
+                f'(SHA-256 {report["romfs_sha256"][:12]}…): the app is built without it')
+            return False
+        shutil.rmtree(aoc / index, ignore_errors=True)
+        aoc.mkdir(parents=True, exist_ok=True)
+        (staging / index).rename(aoc / index)
+        return True
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
 def step_code_ns2(tree, dump, g, env, logs, app=None):
     """The dump's ExeFS and RomFS into the work folder (import_dump.py), checked against the verified values, and the code
     rewritten for Apple silicon as for Tears of the Kingdom, the result checked against the verified rewrite."""
@@ -2595,11 +2879,11 @@ def step_code_ns2(tree, dump, g, env, logs, app=None):
     if not imported() and not adopt_game_data(
             tree, app, v, romfs, logs, index=lambda image, digest, source: [
                 py, 'scripts/import_dump.py', dump, '--output', tree / f'extracted/{v}', '--update', g['update'],
-                '--adopted-image', source, '--sha256', digest, '--romfs-output', image.parent]):
+                *ns2_source_args(dump), '--adopted-image', source, '--sha256', digest, '--romfs-output', image.parent]):
         say(f'1/4 code: importing the dump (its code and the {expected["romfs"]["size"] / 2**30:.1f} GB of game data; a few minutes)'
             + ('' if romfs_mismatch(romfs, expected) is None else f': {romfs_mismatch(romfs, expected)}'))
-        run([py, 'scripts/import_dump.py', dump, '--output', tree / f'extracted/{v}', '--update', g['update']],
-            logs / f'import_dump-{v}.log', cwd=tree)
+        run([py, 'scripts/import_dump.py', dump, '--output', tree / f'extracted/{v}', '--update', g['update'],
+             *ns2_source_args(dump)], logs / f'import_dump-{v}.log', cwd=tree)
     for n, h in expected['exefs_sha256'].items():
         if not (exefs / n).is_file():
             raise BuildError(f'ExeFS {n} is missing from the dump; not the supported version')
@@ -2721,15 +3005,14 @@ def main_ns2(args, dump):
     device_app = args.platform == 'ios'
     if args.update or args.dlc or args.mod:
         raise BuildError('a Switch 2 dump folder holds its update itself: leave out --update, --dlc and --mod')
-    exefs = ns2_dump_exefs(dump)
-    title = npdm_program_id(exefs / 'main.npdm') if (exefs / 'main.npdm').is_file() else None
+    title = ns2_source_title(dump)
     if title == '0400486024DEC000':
         return build_oot(args, dump)
     g = NS2.get(title or '')
     if not g:
-        raise BuildError(f'{dump}: not a supported Switch 2 dump (title {title or "unknown"} in {exefs}); supported: '
+        raise BuildError(f'{dump}: not a supported Switch 2 dump (title {title or "unknown"}); supported: '
                          + ', '.join(f'{APPS[x["version"]][0]} ({t}, update {x["update"]})' for t, x in NS2.items()))
-    if not (dump / 'updates' / g['update'] / 'exefs').is_dir():
+    if dump.is_dir() and not (dump / 'updates' / g['update'] / 'exefs').is_dir():
         raise BuildError(f'{dump}: needs updates/{g["update"]} ({VERSIONS[g["version"]]["display_version"]}); this dump has '
                          + ', '.join(p.name for p in sorted((dump / 'updates').glob('*'))) if (dump / 'updates').is_dir() else 'no updates/')
     v = g['version']; app_name, bundle_id, executable = APPS[v]
@@ -2746,6 +3029,7 @@ def main_ns2(args, dump):
     say(f'{app_name} {VERSIONS[v]["display_version"]} from {dump}; work folder {work} ({why})')
     ns2_shared_fonts(tree / 'extracted/firmware/shared-fonts', shared_fonts)
     step_code_ns2(tree, dump, g, env, logs, app=out if out.suffix == '.app' else None)
+    step_aoc_ns2(tree, dump, g, logs)
     if v == 'dkb':
         for size in ('2560x1440', '3840x2160'):
             run([py, 'scripts/make_output_res_overlay.py', size, '--version', v],
@@ -3160,10 +3444,28 @@ def build_oot(args, source):
                            shader_chain=shader_chain), args)
 
 
+def check_nup(source):
+    """The game of a .nup, from its package table (#2333); only Ocarina of Time 2.0.0 and Bananza 3.2.0 are built from one."""
+    from tools import nup_title
+    try:
+        title, versions = nup_title.read(source)
+    except nup_title.READ_ERRORS as e:
+        raise BuildError(f'{source.name}: cannot read this .nup: {e}') from e
+    if not nup_title.builds(title, versions):
+        have = ', '.join(nup_title.version_name(v, title) for v in versions)
+        raise BuildError(f'{source.name}: title {title} version {have}; only Ocarina of Time '
+                         f'{nup_title.version_name(nup_title.OOT_VERSION)} and Donkey Kong Bananza 3.2.0 '
+                         f'(v{nup_title.BANANZA_VERSION}) are built from a .nup')
+    return title
+
+
 def main(argv):
     args = parse_args(argv)
     if args.game.suffix.lower() == '.nup':
-        return build_oot(args, args.game.expanduser().resolve())
+        from tools import nup_title
+        source = args.game.expanduser().resolve()
+        title = check_nup(source)
+        return build_oot(args, source) if title == nup_title.OOT_TITLE else main_ns2(args, source)
     if args.game.expanduser().is_dir():   # a Switch 2 dump folder
         return main_ns2(args, args.game.expanduser().resolve())
     if not args.keys:

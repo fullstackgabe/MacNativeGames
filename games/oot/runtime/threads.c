@@ -421,41 +421,60 @@ static void wake_queue(thr_t *t) {
 }
 #endif
 void runtime_describe_address(uint64_t a, char *out, size_t n);
-#define CORE_DIAG_NS 4000000L
+/* TOTK_CORE_DIAG: a wait for a virtual core this long gets one report of the core owners. TOTK_CORE_DIAG_MS sets it
+   (default 4 ms; 2026-11-17 OOT: 30 finds the in-world waits of 150-300 ms a frame, which the 400 reports at 4 ms were
+   spent on before the world). */
+static long core_diag_ns(void) { static long v; if (!v) { const char *e = getenv("TOTK_CORE_DIAG_MS"); long ms = e && *e ? atol(e) : 4; v = (ms < 1 ? 1 : ms) * 1000000L; } return v; }
+#define CORE_DIAG_NS ((uint64_t)core_diag_ns())
 static int core_diag_on(void) { return dm_core_diag_enabled(); }
 static int g_core_reports;
+void runtime_hle_describe(unsigned i, char *out, size_t n);   // hle_stack.c (a weak fallback below)
 /* Enter/return holding G. Snapshot retained Mach ports, then drop G before suspending or formatting:
    an owner may be in host code holding an allocator/dyld lock, or may next need the scheduler lock. */
 static void core_wait_report(thr_t *w, uint64_t since) {
     if (g_core_reports++ >= 400) return;
-    struct { mach_port_t port; uint32_t handle; int prio; uint64_t mask, held; int svc; } owners[NCORE] = {0};
+    struct { mach_port_t port; uint32_t handle; int prio; uint64_t mask, held; int svc, hle; } owners[NCORE] = {0};
     uint64_t now = now_ns(), mask = w->mask; uint32_t handle = w->handle; int prio = w->prio;
     for (int i=0;i<NCORE;i++) {
         thr_t *o = g_core_owner[i]; if (!o) continue;
         owners[i].handle=o->handle; owners[i].prio=o->prio; owners[i].mask=o->mask;
         owners[i].held=o->core_since ? now-o->core_since : 0; owners[i].svc=o->last_svc;
+        owners[i].hle=o->last_hle;   // with "hletrace 1": the host function it called last (2026-11-17: an owner waited in a host lock, its name not on the stack)
         if (o->mport && mach_port_mod_refs(mach_task_self(), o->mport, MACH_PORT_RIGHT_SEND, 1) == KERN_SUCCESS) owners[i].port=o->mport;
     }
     pthread_mutex_unlock(&G);
-    char pc[NCORE][96], lr[NCORE][96];
+    char pc[NCORE][96], lr[NCORE][96], up[NCORE][640];
     for (int i=0;i<NCORE;i++) {
-        strcpy(pc[i], "?"); strcpy(lr[i], "?"); mach_port_t port=owners[i].port;
+        strcpy(pc[i], "?"); strcpy(lr[i], "?"); up[i][0]=0; mach_port_t port=owners[i].port;
         if (!port) continue;
         arm_thread_state64_t state; mach_msg_type_number_t count=ARM_THREAD_STATE64_COUNT; int ok=0;
+        uint64_t calls[8]; int ncalls=0;
         if (thread_suspend(port)==KERN_SUCCESS) {
             ok=thread_get_state(port, ARM_THREAD_STATE64, (thread_state_t)&state, &count)==KERN_SUCCESS;
+            /* Further callers along the frame pointers (2026-11-17: owners waited 30-41 ms in a host mutex, and pc / lr
+               named only the pthread functions). Read with vm_read_overwrite: a bad frame fails, it does not fault. */
+            for (uint64_t fp = ok ? arm_thread_state64_get_fp(state) : 0; fp && !(fp & 7) && ncalls < 8; ) {
+                uint64_t fr[2]; vm_size_t got = 0;
+                if (vm_read_overwrite(mach_task_self(), (vm_address_t)fp, sizeof fr, (vm_address_t)(uintptr_t)fr, &got) != KERN_SUCCESS || got != sizeof fr) break;
+                if (fr[1]) calls[ncalls++] = fr[1] & 0x0000ffffffffffffull;
+                if (fr[0] <= fp || fr[0] - fp > (1u << 20)) break;
+                fp = fr[0];
+            }
             thread_resume(port);
         }
         mach_port_deallocate(mach_task_self(), port);
         if (ok) { runtime_describe_address(arm_thread_state64_get_pc(state), pc[i], sizeof pc[i]);
-                  runtime_describe_address(arm_thread_state64_get_lr(state), lr[i], sizeof lr[i]); }
+                  runtime_describe_address(arm_thread_state64_get_lr(state), lr[i], sizeof lr[i]);
+                  size_t o=0; for (int k=1;k<ncalls && o<sizeof up[i]-100;k++) { char d[96]; runtime_describe_address(calls[k], d, sizeof d); o+=(size_t)snprintf(up[i]+o, sizeof up[i]-o, " <- %s", d); } }
     }
-    fprintf(stderr, "[core-wait] thread %#x (priority %d, mask %#llx) waited %.1f ms:", handle, prio, (unsigned long long)mask, (now-since)/1e6);
+    uint64_t dm_nvn_frame_count(void);
+    fprintf(stderr, "[core-wait] frame %llu thread %#x (priority %d, mask %#llx) waited %.1f ms:", (unsigned long long)dm_nvn_frame_count(), handle, prio, (unsigned long long)mask, (now-since)/1e6);
     for (int i=0;i<NCORE;i++) {
         if (!owners[i].handle) { fprintf(stderr, " core %d free;", i); continue; }
-        fprintf(stderr, " core %d%s: %#x (priority %d, mask %#llx, held %.1f ms, last svc %#x) at %s <- %s;", i,
+        char hle[160] = ""; if (owners[i].hle) { char nm[140]; runtime_hle_describe((unsigned)owners[i].hle - 1, nm, sizeof nm); snprintf(hle, sizeof hle, ", last host call %s", nm); }
+        fprintf(stderr, " core %d%s: %#x (priority %d, mask %#llx, held %.1f ms, last svc %#x%s) at %s <- %s%s;", i,
             (mask>>i&1) ? "" : " (not in mask)", owners[i].handle, owners[i].prio, (unsigned long long)owners[i].mask,
-            owners[i].held/1e6, owners[i].svc, pc[i], lr[i]);
+            owners[i].held/1e6, owners[i].svc, hle, pc[i], lr[i], up[i]);
     }
     fputc('\n',stderr);
     pthread_mutex_lock(&G);
@@ -1037,14 +1056,29 @@ static void se_unbind(uint32_t wh) {   // 调用方持 G | Caller holds G
    Off by default: on the Mac at about 100 fps (1.2.1 field save, 300 s each) it saved 3% CPU (708 -> 685 s) but frames
    dropped steadily, 10-15 per 300 instead of 0-3. TOTK_YIELD_BACKOFF=on turns it on (250:2000); =<cap µs>[:<start µs>]
    sets the cap and the start. Returns the sleep for a yield whose run started run_ns ago, 0 for a plain yield. */
+/* "flag yield_backoff <cap µs>" (0 = off) and "flag yield_start <µs>" set them while the game runs, so one run at one
+   place can compare settings (2026-11-24: the ten workers' plain yields were about 1.2 cores at 99 fps in the field). */
+static _Atomic int64_t g_yield_cap = -1, g_yield_start = 2000000;
+void runtime_yield_backoff_set(int cap_us, int start_us) {
+    if (start_us >= 0) atomic_store(&g_yield_start, (int64_t)start_us * 1000);
+    if (cap_us >= 0) atomic_store(&g_yield_cap, (int64_t)cap_us * 1000);
+    LOG("[flag] yield back-off: sleeps at most %lld us after %lld us of yields (0 = off)", (long long)(atomic_load(&g_yield_cap) / 1000), (long long)(atomic_load(&g_yield_start) / 1000));
+}
+/* "flag yield_fast <bits>" (test, 2026-11-24): 1 = a yield takes the scheduler lock only when a thread waits for a core
+   (a racy look, as runtime_spin_wait's: a waiter missed now is seen at the next yield); 2 = no host sched_yield when the
+   core is not handed over (the Mac has cores to spare; the game's workers poll in short runs of yields between waits). */
+static _Atomic int g_yield_fast;
+void runtime_yield_fast_set(int bits) { atomic_store(&g_yield_fast, bits); LOG("[flag] yield_fast = %d (1 no lock without a core waiter, 2 no host yield)", bits); }
 static uint64_t yield_backoff_ns(uint64_t run_ns) {
-    static int64_t cap = -1, start = 2000000;
+    int64_t cap = atomic_load_explicit(&g_yield_cap, memory_order_relaxed), start = atomic_load_explicit(&g_yield_start, memory_order_relaxed);
     if (cap < 0) {
         const char *e = getenv("TOTK_YIELD_BACKOFF"); int64_t c = 0;
         if (e && !strcmp(e, "on")) c = 250000;
         else if (e && *e) { c = atoll(e) * 1000; const char *colon = strchr(e, ':'); if (colon) start = atoll(colon + 1) * 1000; }
         if (c) LOG("TOTK_YIELD_BACKOFF: a run of yields backs off after %lld us, sleeping at most %lld us", (long long)(start / 1000), (long long)(c / 1000));
-        cap = c;
+        int64_t unset = -1; if (!atomic_compare_exchange_strong(&g_yield_cap, &unset, c)) c = unset;   // a flag set it meanwhile
+        else atomic_store(&g_yield_start, start);
+        cap = c; start = atomic_load(&g_yield_start);
     }
     if (!cap || run_ns < (uint64_t)start) return 0;
     uint64_t s = run_ns / 8; if (s < 10000) s = 10000;
@@ -1116,17 +1150,20 @@ static int svc_thread_(int num, uint64_t *regs) {
             uint64_t y0 = now_ns();
             if (me && me->nsvc != me->yrun_svc + 1) me->yrun_ns = y0;   // another SVC since the last yield: a new run
             if (me) me->yrun_svc = me->nsvc;
+            const int fast = atomic_load_explicit(&g_yield_fast, memory_order_relaxed);
+            int give = 0; uint64_t sb0 = svc_stats_on() ? runtime_now_ns() : 0;   // TOTK_SVC_STATS: a yield's core hand-over, sleep and sched_yield count as blocked time
+            if (!(fast & 1) || __atomic_load_n(&g_core_wait, __ATOMIC_RELAXED)) {
             pthread_mutex_lock(&G);   // Horizon yield: hand the core to a waiting thread of equal or higher priority
-            int give = 0; for (thr_t *w = g_core_wait; w && !give; w = w->cnext) give = me->cur_core >= 0 && core_allowed(w, me->cur_core) && w->prio <= me->prio;
-            uint64_t sb0 = svc_stats_on() ? runtime_now_ns() : 0;   // TOTK_SVC_STATS: a yield's core hand-over, sleep and sched_yield count as blocked time
+            for (thr_t *w = g_core_wait; w && !give; w = w->cnext) give = me->cur_core >= 0 && core_allowed(w, me->cur_core) && w->prio <= me->prio;
             if (give) { core_put(me); core_take(me); }
             pthread_mutex_unlock(&G);
+            }
             uint64_t backoff = !give && me ? yield_backoff_ns(y0 - me->yrun_ns) : 0;
             if (backoff) {   // a long poll: sleep with the core given up, as SleepThread(ns) does
                 pthread_mutex_lock(&G); core_put(me); pthread_mutex_unlock(&G);
                 struct timespec ts = {0, (long)backoff}; nanosleep(&ts, 0);
                 pthread_mutex_lock(&G); core_take(me); pthread_mutex_unlock(&G);
-            } else if (!give) sched_yield();
+            } else if (!give && !(fast & 2)) sched_yield();
             if (sb0) t_svc_blocked += runtime_now_ns() - sb0;
 #ifdef GAME_BOTW
             if (me && me->handle == g_main_handle) { g_main_yield_ns += now_ns() - y0; g_main_yield_n++; }
@@ -1399,6 +1436,20 @@ __attribute__((weak)) void runtime_ipc_session_closed(void *s) { (void)s; die("I
 __attribute__((weak)) void runtime_ipc_tmem_closed(void *t) { (void)t; die("transfer memory closed without ipc.c"); }
 uint32_t runtime_handle_new(int session, void *obj) { pthread_mutex_lock(&G); uint32_t h = h_new(session ? O_SESSION : O_TMEM, obj); pthread_mutex_unlock(&G); return h; }
 void *runtime_handle_get(uint32_t h, int session) { pthread_mutex_lock(&G); void *o = h_peek(h, session ? O_SESSION : O_TMEM); pthread_mutex_unlock(&G); return o; }
+/* Removes a session handle without closing the session (ipc.c, shared/: a session made inside a CMIF domain becomes a
+   domain object). */
+void *runtime_handle_take_session(uint32_t h) {
+    pthread_mutex_lock(&G); void *o = h_peek(h, O_SESSION);
+    if (o) {
+#ifdef GAME_BOTW
+        unsigned i = h_index(h);
+#else
+        unsigned i = h - 0x1000;
+#endif
+        g_h[i].type = O_FREE; g_h[i].obj = NULL;
+    }
+    pthread_mutex_unlock(&G); return o;
+}
 // Service-side event: returns the writable handle kept by the service.
 uint32_t runtime_event_new(void) {
     event_t *e = calloc(1, sizeof *e); if (!e) die("event allocation"); e->refs = 1;

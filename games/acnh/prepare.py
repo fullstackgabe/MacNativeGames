@@ -19,7 +19,9 @@ from games.acnh.tools.common import outside_repository, sha256_file, verified_fi
 from games.acnh.tools.identity import select_program
 
 TITLE_ID = "01006F8002326000"
-SUPPORTED_UPDATES = (458752, 2097152)
+SUPPORTED_UPDATES = (458752, 2097152, 2228224)
+# The 3.0 line shares rtld, sdk and subsdk0 byte for byte; what depends only on them (NVN 55.15, DLC mounts) covers each.
+SDK_3_0_UPDATES = (2097152, 2228224)
 SERVICE_GROUPS = ("nn::time", "nn::bcat", "nn::fs", "nn::account", "nn::nifm",
                   "nn::ldn", "nn::socket", "nn::friends", "nn::nfp", "nn::prepo")
 
@@ -39,7 +41,7 @@ def write_json(path, value):
 
 def profile(version):
     require(type(version) is int and version in (0, *SUPPORTED_UPDATES),
-            f"Unsupported ACNH version: {version}; expected base 1.0.0 or update 1.2.1 / 3.0.1")
+            f"Unsupported ACNH version: {version}; expected base 1.0.0 or update 1.2.1 / 3.0.1 / 3.0.3")
     return read_json(HERE / "assets" / f"expected-v{version}.json")
 
 
@@ -171,6 +173,7 @@ def prepare(base, update, keys, work, hactool=None):
             summary["hactool_sha256"] = sha256_file(hactool)
             run_step(work, "romfs-merge", TOOLS / "extract_update_romfs.py", base, update,
                      "--keys", keys, "--title-id", TITLE_ID, "--hactool", hactool,
+                     *(["--pinned-sha256", expected["update"]["romfs_sha256"]] if "romfs_sha256" in expected["update"] else []),
                      "--output", target / "romfs")
             index = read_json(target / "romfs/index.json")
             summary["romfs"] = {key: index[key] for key in ("status", "romfs_size", "romfs_sha256", "integrity")}

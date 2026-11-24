@@ -17,13 +17,16 @@ import sys
 from pathlib import Path
 
 from .core import DepsError, cache, fetch, git_fetch, install, jobs, locked, run, say, unpack
+from .offline import activate as _offline
 from .pins import BUILD_TOOLS, SOURCES
+
+_offline()   # a released Launcher's store (offline.py) also for a Makefile's `python3 tools/deps …`
 
 # A build copies a game's sources into its work folder and runs scripts there; they find this repository (and so
 # tools/deps) through MNG_REPO, which every process that imported tools/deps passes on to the ones it starts.
 os.environ.setdefault('MNG_REPO', str(Path(__file__).resolve().parents[2]))
 
-__all__ = ['DepsError', 'cache', 'env', 'path', 'prefix', 'program', 'build_tools', 'python_environment', 'LIBRARIES', 'PROGRAMS']
+__all__ = ['DepsError', 'cache', 'env', 'path', 'prefix', 'program', 'build_tools', 'python_environment', 'source', 'LIBRARIES', 'PROGRAMS']
 
 # library or tool name: (folder under the cache, the file whose presence means it is installed)
 def _folder(name):
@@ -93,9 +96,18 @@ def prefix(name):
         return folder
     with locked():
         if not (folder / MARKER[name]).exists():
-            version = SOURCES[name][0]
-            say(f'making {name} {version} from its pinned source, once for this Mac (log: {cache() / "logs"})')
-            install(folder, lambda stage: RECIPES[name](stage))
+            from .offline import built
+            try:   # a released Launcher's copy, made at the release (user 2026-11-22: "做")
+                carried = built(_folder(name))
+            except ValueError as e:
+                raise DepsError(str(e)) from None
+            if carried is not None:
+                say(f'{name} {SOURCES[name][0]}: the copy the Launcher carries, made at its release')
+                install(folder, lambda stage: shutil.copytree(carried, stage, symlinks=True))
+            else:
+                version = SOURCES[name][0]
+                say(f'making {name} {version} from its pinned source, once for this Mac (log: {cache() / "logs"})')
+                install(folder, lambda stage: RECIPES[name](stage))
     return folder
 
 
@@ -164,6 +176,22 @@ def venv_python():
 
 
 # ---- recipes: each installs into stage (install() renames it to the prefix when it finished) ----
+def source(name):
+    """Pinned source for out-of-tree cross-compilation, shared by device targets."""
+    version, url, pin = SOURCES[name]
+    with locked():
+        if url.endswith('.git'):
+            return _checkout(name)
+        folder = cache() / 'src' / _folder(name)
+        marker = folder / '.mng-source-pin'
+        if not marker.is_file() or marker.read_text().strip() != pin:
+            archive = fetch(url, pin, url.rsplit('/', 1)[1])
+            unpack(archive, folder)
+            marker.write_text(pin + '\n')
+        inside = [p for p in folder.iterdir() if not p.name.startswith('.')]
+        return inside[0] if len(inside) == 1 and inside[0].is_dir() else folder
+
+
 def _source(name):
     """A fresh unpacked copy of a release archive: the folder it holds (one top folder) or the unpacked folder."""
     version, url, want = SOURCES[name]
@@ -250,14 +278,47 @@ def _cmake_install(name, src, stage, *options, extra_env=None):
     run([tools / 'cmake', '--install', build], f'{name}-install.log', env=env)
 
 
+def spirv_cross_source():
+    """Pinned source tree for targets that cross-compile the in-process translator."""
+    with locked():
+        return _checkout('spirv-cross')
+
+
+# The spirv-cross program's sources and the flags of SPIRV-Cross's CMake Release build of it (its CMakeLists.txt:
+# CMAKE_CXX_STANDARD 11, the CLI target with HAVE_SPIRV_CROSS_GIT_VERSION), compiled with clang alone like build_app.py's
+# (SPIRV_CROSS_SOURCES): no CMake, whose 54 MB a player's Launcher would otherwise carry (user 2026-11-22: "好").
+SPIRV_CROSS_SOURCES = ('main.cpp', 'spirv_cfg.cpp', 'spirv_cpp.cpp', 'spirv_cross.cpp', 'spirv_cross_parsed_ir.cpp',
+                       'spirv_cross_util.cpp', 'spirv_glsl.cpp', 'spirv_hlsl.cpp', 'spirv_msl.cpp', 'spirv_parser.cpp',
+                       'spirv_reflect.cpp')
+SPIRV_CROSS_FLAGS = ('-O3', '-DNDEBUG', '-std=gnu++11', '-arch', 'arm64', '-Wno-deprecated-declarations',
+                     '-DHAVE_SPIRV_CROSS_GIT_VERSION')
+
+
+def spirv_cross_revision(src):
+    """The line --revision prints, as SPIRV-Cross's CMake writes it (gitversion.in.h): git describe of the checkout and
+    the commit's own time (CMake's string(TIMESTAMP) under SOURCE_DATE_EPOCH, local time), the same on every rebuild:
+    nxnative keys its shader cache on that line."""
+    import time
+    git = lambda *a: subprocess.run(['git', '-C', src, *a], capture_output=True, text=True, check=True).stdout.strip()
+    when = time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(int(git('log', '-1', '--format=%ct'))))
+    return f'Git commit: {git("describe", "--always", "--tags", "--dirty=+")} Timestamp: {when}'
+
+
 def _spirv_cross(stage):
-    """With CMake, which writes the commit (git describe) into --revision: nxnative keys its shader cache on that line."""
     src = _checkout('spirv-cross')
-    # Its "Timestamp:" is the build time unless SOURCE_DATE_EPOCH is set: the commit's own time keeps the line the same
-    # on every Mac and every rebuild, so the shader cache keyed on it is not thrown away for nothing.
-    when = subprocess.run(['git', '-C', src, 'log', '-1', '--format=%ct'], capture_output=True, text=True, check=True).stdout.strip()
-    _cmake_install('spirv-cross', src, stage, '-DSPIRV_CROSS_CLI=ON', '-DSPIRV_CROSS_STATIC=ON',
-                   '-DSPIRV_CROSS_SHARED=OFF', '-DSPIRV_CROSS_ENABLE_TESTS=OFF', extra_env={'SOURCE_DATE_EPOCH': when})
+    build = cache() / 'build' / 'spirv-cross-build'
+    if build.exists():
+        shutil.rmtree(build)
+    build.mkdir(parents=True)
+    (build / 'gitversion.h').write_text('#ifndef SPIRV_CROSS_GIT_VERSION_H_\n#define SPIRV_CROSS_GIT_VERSION_H_\n'
+                                        f'#define SPIRV_CROSS_GIT_REVISION "{spirv_cross_revision(src)}"\n#endif\n')
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(int(jobs())) as pool:
+        list(pool.map(lambda name: run(['xcrun', 'clang++', *SPIRV_CROSS_FLAGS, f'-I{build}', '-c', src / name,
+                                        '-o', build / f'{name}.o'], f'spirv-cross-{name}.log'), SPIRV_CROSS_SOURCES))
+    (stage / 'bin').mkdir(parents=True)
+    run(['xcrun', 'clang++', '-arch', 'arm64', *[build / f'{n}.o' for n in SPIRV_CROSS_SOURCES], '-o', stage / 'bin/spirv-cross'],
+        'spirv-cross-link.log')
 
 
 def _glslang(stage):

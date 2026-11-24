@@ -43,8 +43,11 @@ def requirements():
 
 
 def pip_argv(folder, requirements_file):
-    return [python(folder), '-I', '-m', 'pip', 'install', '--isolated', '--disable-pip-version-check', '--no-input',
-            '--index-url', INDEX, '--no-deps', '--only-binary=:all:', '--require-hashes', '-r', requirements_file]
+    from tools.deps.offline import store
+    carried = store()   # a released Launcher carries the wheel (tools/deps/offline.py): no download
+    source = ['--no-index', '--find-links', str(carried / 'wheels')] if carried else ['--index-url', INDEX]
+    return [python(folder), '-I', '-B', '-m', 'pip', 'install', '--isolated', '--disable-pip-version-check', '--no-input',
+            *source, '--no-deps', '--only-binary=:all:', '--require-hashes', '-r', requirements_file]
 
 
 def pip_env():
@@ -54,7 +57,7 @@ def pip_env():
 
 def _check(folder, cancel=None):
     try:
-        code, out, _ = cancellable.run([python(folder), '-I', '-c', CHECK], cancel, CHECK_S)
+        code, out, _ = cancellable.run([python(folder), '-I', '-B', '-c', CHECK], cancel, CHECK_S)
     except cancellable.Stopped as stop:
         if stop.reason == 'cancelled':
             raise EnvError('cancelled') from None
@@ -86,7 +89,7 @@ def install(builder_dir, cancel=None):
     shutil.rmtree(partial, ignore_errors=True)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        _step([sys.executable, '-I', '-m', 'venv', partial], cancel, VENV_S, 'venv')
+        _step([sys.executable, '-I', '-B', '-m', 'venv', partial], cancel, VENV_S, 'venv')
         wanted = partial / 'requirements.txt'
         wanted.write_text(requirements())
         _step(pip_argv(partial, wanted), cancel, PIP_S, 'pip', pip_env())

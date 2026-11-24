@@ -22,12 +22,17 @@ class ShaderStartupMemory(unittest.TestCase):
         probe = r'''
 #import "totk_shader_seed.h"
 #include "totk_seed_image.h"
+#include "totk_rt_carry.h"
+#include "totk_rt_translator.h"
 #include <malloc/malloc.h>
+#include <stdatomic.h>
 static NSString *g_dir, *g_seed_dir;
 static NSSet *g_seed_names;
 static seed_image g_seed_img;
+static _Atomic(seed_image_preloaded *) g_seed_pre;   // 2026-11-19: totk_rt_dir starts the variant-index preload once the image opens
 static NSString *g_seed_prefix;
 static BOOL g_seed_all_default;
+static BOOL g_seed_sealed;   // 2026-11-17: totk_rt_dir also notes whether the seed's variants were checked at packaging
 static void (*runtime_boot_status)(const char *, const char *);
 static NSString *root_dir(void) { return @"unused"; }
 static NSString *seed_dir(void) { return @(getenv("TOTK_SHADER_SEED_DIR")); }
@@ -35,6 +40,8 @@ static void seed_mark_broken(NSString *name) { (void)name; }
 static void seed_progress(int pass, NSUInteger done, NSUInteger total) {
     (void)pass; (void)done; (void)total;
 }
+// The synthetic cache has no collected pipeline list to migrate.
+static NSUInteger rt_list_put_on_seed(void) { return 0; }
 #define TOTK_UI(zh, en) en
 #define LOG(...) fprintf(stderr, __VA_ARGS__)
 BODY
@@ -95,6 +102,7 @@ int main(int argc, const char **argv) { @autoreleasepool {
                         # Use an empty cache for the read-in-place path, without copied seed files.
                         target = root/('overlay-'+mode) if phase == 'overlay' else cache
                         env = dict(os.environ, TOTK_SHADER_SEED_DIR=str(source), TOTK_SHADER_CACHE=str(target),
+                            TOTK_SHADER_XLATE=str(root/'no-translator'),
                             TOTK_SHADER_SEED='on', TOTK_SHADER_SEED_IN_PLACE='1' if phase == 'overlay' else '0')
                         run = subprocess.run([str(exe), phase], capture_output=True, text=True, env=env, timeout=60)
                         self.assertEqual(run.returncode, 0, run.stdout+run.stderr)
